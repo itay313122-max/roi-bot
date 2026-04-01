@@ -1,0 +1,7 @@
+python-telegram-bot
+groq
+python-dotenv
+requests
+beautifulsoup4
+openpyxl
+httpx

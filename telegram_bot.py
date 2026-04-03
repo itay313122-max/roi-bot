@@ -1,16 +1,34 @@
+import asyncio
+import re
+from typing import Optional
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import os
 from dotenv import load_dotenv
 from agent_brain import think, extract_client_info
 from excel_reporter import add_client
-from yad2_scraper import search_and_recommend
+from yad2_scraper import search_and_recommend, deep_analyze_property_full
 
 load_dotenv()
 
 conversations = {}
 searching = {}
 questions_asked = {}
+
+
+def _parse_apartment_choice(text: str) -> Optional[int]:
+    t = (text or "").strip()
+    if t in ("1", "2", "3"):
+        return int(t)
+    m = re.match(r"דירה\s*([123])", t)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"\b([123])\b", t)
+    if m2 and len(t) <= 12:
+        return int(m2.group(1))
+    return None
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -22,6 +40,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         searching[user_id] = False
         questions_asked[user_id] = 0
         print(f"לקוח חדש: {user_name}")
+        try:
+            add_client(
+                name=user_name,
+                area="לא ידוע",
+                rooms="לא ידוע",
+                budget="לא ידוע",
+                deal_type="לא ידוע",
+                notes="נכנס לראשונה",
+            )
+        except Exception as e:
+            print(f"שגיאה ברישום לקוח חדש לאקסל: {e}")
+
+    if context.user_data.get("awaiting_property_choice"):
+        low = user_message.strip().lower()
+        if low in ("ביטול", "לא", "לא עכשיו", "תודה"):
+            context.user_data["awaiting_property_choice"] = False
+        else:
+            pick = _parse_apartment_choice(user_message)
+            props = context.user_data.get("last_properties") or []
+            if pick is not None and 1 <= pick <= len(props):
+                chosen = props[pick - 1]
+                await update.message.reply_text("מכין דוח מעמיק...")
+                report = await asyncio.to_thread(
+                    deep_analyze_property_full,
+                    chosen["url"],
+                    chosen["title"],
+                )
+                await update.message.reply_text(report)
+                context.user_data["awaiting_property_choice"] = False
+                conversations[user_id].append({
+                    "role": "user",
+                    "content": user_message,
+                })
+                conversations[user_id].append({
+                    "role": "assistant",
+                    "content": report,
+                })
+                print(f"{user_name}: {user_message}")
+                print(f"רועי: דוח מלא לדירה {pick}")
+                return
+            await update.message.reply_text(
+                "כדי לבחור דירה לניתוח מעמיק כתוב 1, 2 או 3 (או \"דירה 1\"). "
+                "או כתוב ביטול כדי להמשיך בשיחה."
+            )
+            return
 
     conversations[user_id].append({
         "role": "user",
@@ -61,7 +124,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text("🔍 סורק דירות עבורך ב-Realta...")
 
-            result_msg = search_and_recommend(
+            await search_and_recommend(
+                update,
+                context,
                 city=info.get("area", "תל אביב"),
                 rooms=info.get("rooms", "3"),
                 budget=info.get("budget", "5000"),
@@ -72,8 +137,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "קומה": info.get("floor", "")
                 }
             )
-
-            await update.message.reply_text(result_msg)
 
         except Exception as e:
             print(f"שגיאה: {e}")
@@ -97,7 +160,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     await update.message.reply_text("🎯 מעדכן את החיפוש לפי הפרטים שלך...")
 
-                    result_msg = search_and_recommend(
+                    await search_and_recommend(
+                        update,
+                        context,
                         city=info.get("area", "תל אביב"),
                         rooms=info.get("rooms", "3"),
                         budget=info.get("budget", "5000"),
@@ -109,7 +174,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         }
                     )
 
-                    await update.message.reply_text(result_msg)
                     print(f"✅ המלצה מעודכנת נשלחה ל-{user_name}")
 
                 except Exception as e:
@@ -117,6 +181,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"{user_name}: {user_message}")
     print(f"רועי: {reply}")
+
 
 def main():
     token = os.getenv("TELEGRAM_TOKEN")

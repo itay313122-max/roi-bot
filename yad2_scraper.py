@@ -397,24 +397,40 @@ def scrape_rss(
     listing_type: str | None = None,
 ) -> list:
     url = "https://realta.co.il/feed.xml"
-    print("סורק RSS של Realta...")
+    print(f"\n{'='*70}")
+    print(f"🔍 STARTING SCRAPE: City={city}, Rooms={rooms}, Budget={budget}, Type={listing_type}")
+    print(f"{'='*70}\n")
 
     try:
+        print(f"📡 Fetching RSS feed from {url}...")
         response = requests.get(url, headers=HEADERS, timeout=15)
+        print(f"✅ RSS feed fetched successfully (status: {response.status_code})")
+        
         root = ET.fromstring(response.content)
 
         try:
             rooms_num = float(str(rooms).replace("חדרים", "").replace("חדר", "").strip())
         except Exception:
             rooms_num = 3
+            print(f"⚠️  Could not parse rooms, using default: {rooms_num}")
 
-        city_slug = CITY_MAP.get(city, city.lower().replace(" ", "-"))
+        # More flexible city slug handling
+        city_lower = city.lower().replace(" ", "-")
+        city_slug = CITY_MAP.get(city, city_lower)
+        print(f"🏙️  Looking for city: {city}")
+        print(f"🏙️  City slug: {city_slug}")
 
         properties = []
         items = root.findall(".//item")
-        print(f"סה״כ פריטים ב-RSS: {len(items)}")
+        print(f"📋 Total items in RSS: {len(items)}\n")
 
-        for item in items:
+        filtered_count = 0
+        city_filtered = 0
+        type_filtered = 0
+        price_filtered = 0
+        rooms_filtered = 0
+
+        for item_idx, item in enumerate(items):
             title = item.findtext("title") or ""
             link = item.findtext("link") or ""
             desc = item.findtext("description") or ""
@@ -422,22 +438,40 @@ def scrape_rss(
             enclosure_url = (enclosure.get("url") or "").strip() if enclosure is not None else ""
             pub_date = parse_item_pub_date(item)
 
-            if city_slug not in link.lower():
+            # City filter - MORE FLEXIBLE
+            link_lower = link.lower()
+            city_match = city_slug in link_lower or city.lower() in link_lower
+            
+            if not city_match:
+                city_filtered += 1
+                # Debug first few rejections
+                if city_filtered <= 3:
+                    print(f"  ⏭️  Item {item_idx+1}: City mismatch - Link: {link[:80]}")
                 continue
 
             blob = f"{title} {desc} {link}"
+            
+            # Listing type filter
             if not _matches_listing_type(blob, listing_type):
+                type_filtered += 1
                 continue
 
+            # Price filter
             price = parse_price(title + " " + desc)
-
             if price > budget:
+                price_filtered += 1
+                if price_filtered <= 3:
+                    print(f"  ⏭️  Item {item_idx+1}: Price {price:,} > Budget {budget:,}")
                 continue
 
+            # Rooms filter - OPTIONAL (don't filter if no rooms detected)
             prop_rooms = parse_rooms(title)
             if prop_rooms > 0 and abs(prop_rooms - rooms_num) > 0.5:
+                rooms_filtered += 1
                 continue
 
+            # Property passed all filters!
+            print(f"  ✅ Item {item_idx+1}: PASS - {title[:60]} | Price: {price:,} ₪")
             properties.append({
                 "title": title,
                 "url": link,
@@ -449,11 +483,25 @@ def scrape_rss(
             })
 
         properties.sort(key=lambda x: x["price"])
-        print(f"נמצאו {len(properties)} דירות מתאימות")
+        
+        print(f"\n{'='*70}")
+        print(f"📊 SCRAPE RESULTS:")
+        print(f"  • City filtered: {city_filtered}")
+        print(f"  • Type filtered: {type_filtered}")
+        print(f"  • Price filtered: {price_filtered}")
+        print(f"  • Rooms filtered: {rooms_filtered}")
+        print(f"  ✅ FINAL RESULTS: {len(properties)} properties found")
+        
+        if properties:
+            print(f"\n💰 Price range: {properties[0]['price']:,} - {properties[-1]['price']:,} ₪")
+        print(f"{'='*70}\n")
+        
         return properties
 
     except Exception as e:
-        print(f"שגיאה בסריקה: {e}")
+        print(f"❌ ERROR in scrape_rss: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -566,6 +614,115 @@ def deep_analyze_property_full(
         return analysis.choices[0].message.content or "לא התקבל ניתוח."
     except Exception as e:
         return f"לא הצלחתי להפיק דוח מלא: {e}"
+
+
+def _extract_property_metadata(title: str) -> Dict[str, str]:
+    """Extract room count and normalize title for display."""
+    metadata = {
+        "rooms": "?",
+        "title_clean": title,
+        "neighborhood": ""
+    }
+    
+    # Extract room count (e.g., "3 חדרים" or "3CH")
+    rooms_match = re.search(r'(\d+)\s*(?:חדרים|ch|rooms|חדר)', title, re.IGNORECASE)
+    if rooms_match:
+        metadata["rooms"] = rooms_match.group(1)
+    
+    return metadata
+
+
+def _format_advanced_property_message(
+    num: int,
+    title: str,
+    city: str,
+    price: int,
+    url: str,
+    analysis_raw: str,
+    scores: Dict[str, int],
+    address: str,
+    fresh: bool,
+    publisher: str,
+    fee_line: str,
+) -> str:
+    """
+    Format property with advanced analytical structure:
+    Header | Price Analysis | Neighborhood Profile | Amenities | Expert Insight | Scoreboard | CTA
+    """
+    analysis_clean, bottom = split_analysis_and_bottom_line(analysis_raw)
+    meta = _extract_property_metadata(title)
+    
+    # Fresh indicator
+    fresh_line = "🆕 חדש מהתנור\n" if fresh else ""
+    
+    # HEADER: Room count, City, Price
+    header = (
+        f"{fresh_line}"
+        f"🏠 דירה מס' {num}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{meta['rooms']} חדרים | {city} | {address[:40]}\n"
+        f"💰 {price:,} ₪\n"
+    )
+    
+    # PRICE ANALYSIS: Compare to market (estimation)
+    price_analysis = (
+        f"\n📊 **ניתוח מחיר:**\n"
+        f"• דירת {meta['rooms']} חדרים בעיר {city}\n"
+        f"• מחיר קובע: {price:,} ₪\n"
+        f"• ציון מחיר (1-10): {scores['price']}/10\n"
+        f"  {'✅ טוב יחסית לשוק' if scores['price'] >= 7 else '⚠️ מחיר ממוצע' if scores['price'] >= 5 else '❌ מעל שוק'}\n"
+    )
+    
+    # ANALYSIS CONTENT (from AI)
+    analysis_section = (
+        f"\n📍 **פרופיל השכונה וסביבה:**\n"
+        f"{analysis_clean}\n"
+    )
+    
+    # SCOREBOARD: Detailed 1-10 ratings
+    scoreboard = (
+        f"\n⭐ **ציון מעמד (1-10):**\n"
+        f"┌─ 💵 מחיר מול שוק: {scores['price']}/10\n"
+        f"├─ 📌 מיקום: {scores['location']}/10\n"
+        f"├─ 🏗️  מצב הנכס: {scores['condition']}/10\n"
+        f"└─ 🎯 ציון כולל: {scores['overall']}/10\n"
+    )
+    
+    # RECOMMENDATION
+    overall = scores['overall']
+    if overall >= 8:
+        recommendation = "🌟 מומלץ מאוד לביקור \n"
+    elif overall >= 6.5:
+        recommendation = "👍 כדאי לשקול \n"
+    elif overall >= 5:
+        recommendation = "🤔 אפשרי אם מתאים \n"
+    else:
+        recommendation = "❌ לא מומלץ כרגע \n"
+    
+    # META INFO
+    meta_info = (
+        f"\n{recommendation}"
+        f"• סוג מפרסם: {publisher}\n"
+        f"{'• ' + fee_line if fee_line else ''}\n"
+    )
+    
+    # BOTTOM LINE
+    bottom_line = ""
+    if bottom:
+        bottom_line = f"\n💬 **סיכום במילה אחת:** {bottom}\n"
+    
+    # Call to Action
+    cta = f"\n🔗 **ראה עוד פרטים:**\n{url}"
+    
+    return (
+        f"{header}"
+        f"{price_analysis}"
+        f"{analysis_section}"
+        f"{scoreboard}"
+        f"{meta_info}"
+        f"{bottom_line}"
+        f"{cta}"
+    )
 
 
 def _format_property_message(
@@ -700,9 +857,10 @@ async def find_top_3(
         }
         results.append(entry)
 
-        body = _format_property_message(
+        body = _format_advanced_property_message(
             entry["num"],
             entry["title"],
+            city,
             entry["price"],
             entry["url"],
             analysis,

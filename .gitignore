@@ -3,3 +3,15 @@ __pycache__/
 *.pyc
 *.xlsx
 .venv/
+google_creds.json
+*.log
+.DS_Store
+.idea/
+*.swp
+*.swo
+*~
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

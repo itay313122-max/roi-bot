@@ -1,16 +1,16 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# יצירת משתמש מאובטח עבור Hugging Face
+# Create secure user for Hugging Face
 RUN useradd -m -u 1000 user
 USER user
 ENV PATH="/home/user/.local/bin:${PATH}"
 
 WORKDIR /app
 
-# העתקת כל הקבצים לתוך השרת
+# Copy all files into container
 COPY --chown=user . .
 
-# התקנת הספריות
+# Install dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir --upgrade -r requirements.txt
 
@@ -21,5 +21,5 @@ EXPOSE 7860
 ENV PORT=7860
 ENV PYTHONUNBUFFERED=1
 
-# הרצה של הקובץ הראשי (main.py) עם FastAPI + health check
-CMD ["python", "main.py"]
+# Run the bot
+CMD ["python", "app.py"]

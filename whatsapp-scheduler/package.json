@@ -1,13 +1,15 @@
 {
   "name": "whatsapp-scheduler-cloud",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
-    "whatsapp-web.js": "^1.23.0",
+    "@whiskeysockets/baileys": "^6.7.9",
     "qrcode": "^1.5.3",
     "express": "^4.18.2",
     "node-cron": "^3.0.3",
-    "puppeteer": "^21.0.0"
+    "pino": "^9.0.0",
+    "@hapi/boom": "^10.0.1"
   }
 }

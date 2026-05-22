@@ -1,23 +1,31 @@
-const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
-const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+} from '@whiskeysockets/baileys';
+import qrcode from 'qrcode';
+import express from 'express';
+import cron from 'node-cron';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import P from 'pino';
 
-const app = express();
+const __dirname  = path.dirname(fileURLToPath(import.meta.url));
+const app        = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 3000;
-const SCHEDULES_FILE = path.join('/data', 'schedules.json');
+const PORT           = process.env.PORT || 3000;
+const SCHEDULES_FILE = path.join(__dirname, 'schedules.json');
+const AUTH_DIR       = path.join(__dirname, 'auth_info_baileys');
 
 // ─── State ─────────────────────────────────────────────────────────────────
-let currentQR = null;
-let isConnected = false;
-let clientInfo = null;
-const activeCronJobs = {};   // id → cron task  (recurring)
-const activeTimeouts  = {};  // id → timeout handle (one-time)
+let currentQR    = null;
+let isConnected  = false;
+let sock         = null;
+let clientInfo   = null;
+const activeCronJobs = {};  // id → cron task
+const activeTimeouts  = {}; // id → timeout handle
 
 // ─── Schedules Store ───────────────────────────────────────────────────────
 function loadSchedules() {
@@ -27,61 +35,15 @@ function loadSchedules() {
 }
 
 function saveSchedules(schedules) {
-  const dir = path.dirname(SCHEDULES_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(schedules, null, 2));
 }
 
 function formatPhone(phone) {
   const digits = phone.replace(/\D/g, '');
-  if (digits.startsWith('972')) return `${digits}@c.us`;
-  if (digits.startsWith('0'))   return `972${digits.slice(1)}@c.us`;
-  return `972${digits}@c.us`;
+  if (digits.startsWith('972')) return `${digits}@s.whatsapp.net`;
+  if (digits.startsWith('0'))   return `972${digits.slice(1)}@s.whatsapp.net`;
+  return `972${digits}@s.whatsapp.net`;
 }
-
-// ─── WhatsApp Client ───────────────────────────────────────────────────────
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: '/data/.wwebjs_auth' }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--disable-extensions',
-    ],
-  },
-});
-
-client.on('qr', async (qr) => {
-  console.log('📱 QR generated');
-  currentQR = await qrcode.toDataURL(qr);
-  isConnected = false;
-});
-
-client.on('ready', () => {
-  console.log('✅ WhatsApp connected');
-  currentQR = null;
-  isConnected = true;
-  clientInfo = client.info;
-  restoreSchedules();
-});
-
-client.on('auth_failure', () => {
-  console.error('❌ Auth failed');
-  isConnected = false;
-});
-
-client.on('disconnected', () => {
-  console.log('⚠️  Disconnected');
-  isConnected = false;
-  clientInfo = null;
-});
 
 // ─── Recurring cron job ────────────────────────────────────────────────────
 function startCronJob(schedule) {
@@ -90,10 +52,10 @@ function startCronJob(schedule) {
   activeCronJobs[schedule.id] = cron.schedule(schedule.cronExpression, async () => {
     if (!isConnected) return;
     try {
-      await client.sendMessage(formatPhone(schedule.phone), schedule.message);
+      await sock.sendMessage(formatPhone(schedule.phone), { text: schedule.message });
       console.log(`📤 [${schedule.id}] Sent to ${schedule.phone}`);
       const all = loadSchedules();
-      const s = all.find(x => x.id === schedule.id);
+      const s   = all.find(x => x.id === schedule.id);
       if (s) { s.lastSent = new Date().toISOString(); s.sentCount = (s.sentCount || 0) + 1; saveSchedules(all); }
     } catch (err) {
       console.error(`❌ [${schedule.id}] Failed:`, err.message);
@@ -104,12 +66,9 @@ function startCronJob(schedule) {
 // ─── One-time job ─────────────────────────────────────────────────────────
 function scheduleOnce(schedule) {
   const delay = new Date(schedule.sendAt).getTime() - Date.now();
-  if (delay <= 0) return; // already passed
+  if (delay <= 0) return;
 
-  if (activeTimeouts[schedule.id]) {
-    clearTimeout(activeTimeouts[schedule.id]);
-    delete activeTimeouts[schedule.id];
-  }
+  if (activeTimeouts[schedule.id]) { clearTimeout(activeTimeouts[schedule.id]); delete activeTimeouts[schedule.id]; }
 
   activeTimeouts[schedule.id] = setTimeout(async () => {
     delete activeTimeouts[schedule.id];
@@ -118,7 +77,7 @@ function scheduleOnce(schedule) {
       console.error(`❌ [${schedule.id}] One-time skipped — not connected`);
     } else {
       try {
-        await client.sendMessage(formatPhone(schedule.phone), schedule.message);
+        await sock.sendMessage(formatPhone(schedule.phone), { text: schedule.message });
         console.log(`📤 [${schedule.id}] One-time sent to ${schedule.phone}`);
       } catch (err) {
         console.error(`❌ [${schedule.id}] One-time failed:`, err.message);
@@ -126,13 +85,8 @@ function scheduleOnce(schedule) {
     }
 
     const all = loadSchedules();
-    const s = all.find(x => x.id === schedule.id);
-    if (s) {
-      s.active    = false;
-      s.lastSent  = new Date().toISOString();
-      s.sentCount = (s.sentCount || 0) + 1;
-      saveSchedules(all);
-    }
+    const s   = all.find(x => x.id === schedule.id);
+    if (s) { s.active = false; s.lastSent = new Date().toISOString(); s.sentCount = (s.sentCount || 0) + 1; saveSchedules(all); }
   }, delay);
 }
 
@@ -145,40 +99,74 @@ function restoreSchedules() {
   for (const s of schedules) {
     if (s.type === 'once') {
       if (!s.active || !s.sendAt) continue;
-      if (new Date(s.sendAt).getTime() <= now) {
-        console.log(`⏩ [${s.id}] one-time sendAt already passed, skipping`);
-        continue;
-      }
+      if (new Date(s.sendAt).getTime() <= now) { console.log(`⏩ [${s.id}] already passed, skipping`); continue; }
       scheduleOnce(s);
       restored++;
     } else {
-      if (s.active && cron.validate(s.cronExpression)) {
-        startCronJob(s);
-        restored++;
-      }
+      if (s.active && cron.validate(s.cronExpression)) { startCronJob(s); restored++; }
     }
   }
   console.log(`🔄 Restored ${restored} scheduled jobs`);
+}
+
+// ─── WhatsApp connection ───────────────────────────────────────────────────
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+  sock = makeWASocket({
+    auth:               state,
+    logger:             P({ level: 'silent' }),
+    printQRInTerminal:  false,
+  });
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('📱 QR generated');
+      currentQR   = await qrcode.toDataURL(qr);
+      isConnected = false;
+    }
+
+    if (connection === 'close') {
+      isConnected = false;
+      currentQR   = null;
+      clientInfo  = null;
+      const statusCode      = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`⚠️  Disconnected (${statusCode}), reconnect: ${shouldReconnect}`);
+      if (shouldReconnect) setTimeout(connectToWhatsApp, 3000);
+    }
+
+    if (connection === 'open') {
+      console.log('✅ WhatsApp connected');
+      isConnected = true;
+      currentQR   = null;
+      clientInfo  = sock.user;
+      restoreSchedules();
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
 }
 
 // ─── API Routes ────────────────────────────────────────────────────────────
 
 // GET /api/status
 app.get('/api/status', (req, res) => {
+  const phone = clientInfo?.id?.split(':')[0]?.split('@')[0] || null;
   res.json({
     connected:  isConnected,
     hasQR:      !!currentQR,
-    phone:      clientInfo?.wid?.user || null,
-    name:       clientInfo?.pushname  || null,
+    phone,
+    name:       clientInfo?.name || null,
     activeJobs: Object.keys(activeCronJobs).length + Object.keys(activeTimeouts).length,
   });
 });
 
 // GET /api/qr
 app.get('/api/qr', (req, res) => {
-  if (!currentQR) {
-    return res.status(404).json({ error: isConnected ? 'Already connected' : 'QR not ready yet' });
-  }
+  if (!currentQR) return res.status(404).json({ error: isConnected ? 'Already connected' : 'QR not ready yet' });
   res.json({ qr: currentQR });
 });
 
@@ -191,7 +179,7 @@ app.post('/api/send', async (req, res) => {
   if (!phone || !message) return res.status(400).json({ error: 'Missing phone or message' });
   try {
     const chatId = formatPhone(phone);
-    await client.sendMessage(chatId, message);
+    await sock.sendMessage(chatId, { text: message });
     console.log('Message sent successfully to:', chatId);
     res.json({ success: true, sentTo: chatId });
   } catch (err) {
@@ -211,43 +199,41 @@ app.post('/api/schedule', (req, res) => {
   const existing  = schedules.find(s => s.id === id);
 
   if (existing) {
-    Object.assign(existing, { phone: phone.replace(/\D/g, ''), message, cronExpression, active: true, updatedAt: new Date().toISOString() });
+    Object.assign(existing, { phone: phone.replace(/\D/g,''), message, cronExpression, active: true, updatedAt: new Date().toISOString() });
     saveSchedules(schedules);
     startCronJob(existing);
     return res.json({ success: true, schedule: existing, action: 'updated' });
   }
 
-  const newSchedule = { id, phone: phone.replace(/\D/g, ''), message, cronExpression, active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
+  const newSchedule = { id, phone: phone.replace(/\D/g,''), message, cronExpression, active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
   schedules.push(newSchedule);
   saveSchedules(schedules);
   startCronJob(newSchedule);
   res.json({ success: true, schedule: newSchedule, action: 'created' });
 });
 
-// POST /api/schedule-once  (single future message)
+// POST /api/schedule-once
 app.post('/api/schedule-once', (req, res) => {
   const { id, phone, message, sendAt } = req.body;
   if (!id || !phone || !message || !sendAt)
     return res.status(400).json({ error: 'Missing: id, phone, message, sendAt' });
 
   const fireAt = new Date(sendAt);
-  if (isNaN(fireAt.getTime()))
-    return res.status(400).json({ error: `Invalid sendAt: "${sendAt}" — use ISO 8601 (e.g. "2025-05-22T15:30:00")` });
-  if (fireAt.getTime() <= Date.now())
-    return res.status(400).json({ error: 'sendAt must be in the future' });
+  if (isNaN(fireAt.getTime())) return res.status(400).json({ error: `Invalid sendAt: "${sendAt}"` });
+  if (fireAt.getTime() <= Date.now()) return res.status(400).json({ error: 'sendAt must be in the future' });
 
   const schedules = loadSchedules();
   const existing  = schedules.find(s => s.id === id);
 
   if (existing) {
     if (activeTimeouts[id]) { clearTimeout(activeTimeouts[id]); delete activeTimeouts[id]; }
-    Object.assign(existing, { phone: phone.replace(/\D/g, ''), message, sendAt: fireAt.toISOString(), active: true, type: 'once', updatedAt: new Date().toISOString() });
+    Object.assign(existing, { phone: phone.replace(/\D/g,''), message, sendAt: fireAt.toISOString(), active: true, type: 'once', updatedAt: new Date().toISOString() });
     saveSchedules(schedules);
     scheduleOnce(existing);
     return res.json({ success: true, schedule: existing, action: 'updated' });
   }
 
-  const newSchedule = { id, type: 'once', phone: phone.replace(/\D/g, ''), message, sendAt: fireAt.toISOString(), active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
+  const newSchedule = { id, type: 'once', phone: phone.replace(/\D/g,''), message, sendAt: fireAt.toISOString(), active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
   schedules.push(newSchedule);
   saveSchedules(schedules);
   scheduleOnce(newSchedule);
@@ -273,14 +259,9 @@ app.delete('/api/schedule/:id', (req, res) => {
 app.get('/api/schedules', (req, res) => {
   const schedules = loadSchedules();
   const visible = schedules.filter(s => s.type !== 'once' || s.active);
-  res.json(visible.map(s => ({
-    ...s,
-    isRunning: !!(activeCronJobs[s.id] || activeTimeouts[s.id]),
-  })));
+  res.json(visible.map(s => ({ ...s, isRunning: !!(activeCronJobs[s.id] || activeTimeouts[s.id]) })));
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT}`);
-  client.initialize();
-});
+app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+connectToWhatsApp();

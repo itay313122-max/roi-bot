@@ -1,11 +1,13 @@
-const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
-const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
-const pino = require('pino');
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode';
+import express from 'express';
+import cron from 'node-cron';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import P from 'pino';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -45,7 +47,7 @@ async function sendMessage(phone, message) {
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
-  sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: pino({ level: 'silent' }) });
+  sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: P({ level: 'silent' }) });
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) { currentQR = await qrcode.toDataURL(qr); isConnected = false; console.log('QR generated'); }
@@ -79,8 +81,8 @@ function startCronJob(schedule) {
       await sendMessage(schedule.phone, schedule.message);
       const schedules = loadSchedules();
       const s = schedules.find(x => x.id === schedule.id);
-      if (s) { s.lastSent = new Date().toISOString(); s.sentCount = (s.sentCount||0)+1; saveSchedules(schedules); }
-    } catch(err) { console.error('Send error:', err.message); }
+      if (s) { s.lastSent = new Date().toISOString(); s.sentCount = (s.sentCount || 0) + 1; saveSchedules(schedules); }
+    } catch (err) { console.error('Send error:', err.message); }
   });
 }
 
@@ -94,40 +96,51 @@ function scheduleOnce(schedule) {
       const s = schedules.find(x => x.id === schedule.id);
       if (s) { s.active = false; s.lastSent = new Date().toISOString(); s.sentCount = 1; saveSchedules(schedules); }
       delete activeTimeouts[schedule.id];
-    } catch(err) { console.error('Send error:', err.message); }
+    } catch (err) { console.error('Send error:', err.message); }
   }, delay);
 }
 
-app.get('/api/status', (req, res) => res.json({ connected: isConnected, hasQR: !!currentQR, phone: clientPhone, name: clientName, activeJobs: Object.keys(activeCronJobs).length + Object.keys(activeTimeouts).length }));
-app.get('/api/qr', (req, res) => { if (!currentQR) return res.status(404).json({ error: 'No QR' }); res.json({ qr: currentQR }); });
+app.get('/api/status', (req, res) => res.json({
+  connected: isConnected, hasQR: !!currentQR, phone: clientPhone, name: clientName,
+  activeJobs: Object.keys(activeCronJobs).length + Object.keys(activeTimeouts).length
+}));
+
+app.get('/api/qr', (req, res) => {
+  if (!currentQR) return res.status(404).json({ error: 'No QR' });
+  res.json({ qr: currentQR });
+});
+
 app.post('/api/send', async (req, res) => {
   if (!isConnected) return res.status(503).json({ error: 'Not connected' });
   const { phone, message } = req.body;
   if (!phone || !message) return res.status(400).json({ error: 'Missing fields' });
   try { await sendMessage(phone, message); res.json({ success: true }); }
-  catch(err) { res.status(500).json({ error: err.message }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.post('/api/schedule', (req, res) => {
   const { id, phone, message, cronExpression } = req.body;
-  if (!id||!phone||!message||!cronExpression) return res.status(400).json({ error: 'Missing fields' });
+  if (!id || !phone || !message || !cronExpression) return res.status(400).json({ error: 'Missing fields' });
   if (!cron.validate(cronExpression)) return res.status(400).json({ error: 'Invalid cron' });
   const schedules = loadSchedules();
-  const s = { id, phone: phone.replace(/\D/g,''), message, cronExpression, type: 'recurring', active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
+  const s = { id, phone: phone.replace(/\D/g, ''), message, cronExpression, type: 'recurring', active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
   schedules.push(s); saveSchedules(schedules);
   if (isConnected) startCronJob(s);
   res.json({ success: true, schedule: s });
 });
+
 app.post('/api/schedule-once', (req, res) => {
   const { id, phone, message, sendAt } = req.body;
-  if (!id||!phone||!message||!sendAt) return res.status(400).json({ error: 'Missing fields' });
+  if (!id || !phone || !message || !sendAt) return res.status(400).json({ error: 'Missing fields' });
   const date = new Date(sendAt);
-  if (isNaN(date.getTime())||date<=new Date()) return res.status(400).json({ error: 'Invalid date' });
+  if (isNaN(date.getTime()) || date <= new Date()) return res.status(400).json({ error: 'Invalid date' });
   const schedules = loadSchedules();
-  const s = { id, phone: phone.replace(/\D/g,''), message, sendAt: date.toISOString(), type: 'once', active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
+  const s = { id, phone: phone.replace(/\D/g, ''), message, sendAt: date.toISOString(), type: 'once', active: true, sentCount: 0, lastSent: null, createdAt: new Date().toISOString() };
   schedules.push(s); saveSchedules(schedules);
   if (isConnected) scheduleOnce(s);
   res.json({ success: true, schedule: s });
 });
+
 app.delete('/api/schedule/:id', (req, res) => {
   const { id } = req.params;
   const schedules = loadSchedules();
@@ -138,6 +151,9 @@ app.delete('/api/schedule/:id', (req, res) => {
   schedules.splice(idx, 1); saveSchedules(schedules);
   res.json({ success: true });
 });
-app.get('/api/schedules', (req, res) => res.json(loadSchedules().map(s => ({ ...s, isRunning: !!(activeCronJobs[s.id]||activeTimeouts[s.id]) }))));
+
+app.get('/api/schedules', (req, res) =>
+  res.json(loadSchedules().map(s => ({ ...s, isRunning: !!(activeCronJobs[s.id] || activeTimeouts[s.id]) })))
+);
 
 app.listen(PORT, () => { console.log('Server on port', PORT); startWhatsApp(); });

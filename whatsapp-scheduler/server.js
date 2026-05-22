@@ -15,7 +15,7 @@ const app        = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT           = process.env.PORT || 3000;
+const PORT           = process.env.PORT || 8080;
 const SCHEDULES_FILE = path.join(__dirname, 'schedules.json');
 const AUTH_DIR       = path.join(__dirname, 'auth_info_baileys');
 

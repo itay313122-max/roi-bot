@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WhatsApp Scheduler</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; color: #111; }
+    header { background: #25d366; color: #fff; padding: 1rem 2rem; font-size: 1.4rem; font-weight: bold; }
+    main { max-width: 700px; margin: 2rem auto; padding: 0 1rem; display: flex; flex-direction: column; gap: 1.5rem; }
+    .card { background: #fff; border-radius: 10px; padding: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+    h2 { font-size: 1.1rem; margin-bottom: 1rem; color: #128c7e; }
+    #qr-img { display: block; margin: 0 auto; max-width: 220px; }
+    #status-badge { display: inline-block; padding: .3rem .8rem; border-radius: 20px; font-size: .85rem; font-weight: bold; }
+    .connected { background: #d4edda; color: #155724; }
+    .disconnected { background: #f8d7da; color: #721c24; }
+    label { display: block; margin-bottom: .3rem; font-size: .9rem; color: #555; }
+    input, textarea { width: 100%; padding: .6rem .8rem; border: 1px solid #ccc; border-radius: 6px; font-size: .95rem; margin-bottom: .9rem; }
+    textarea { resize: vertical; min-height: 80px; }
+    button { background: #25d366; color: #fff; border: none; padding: .65rem 1.4rem; border-radius: 6px; cursor: pointer; font-size: .95rem; }
+    button:hover { background: #128c7e; }
+    #jobs-list { list-style: none; display: flex; flex-direction: column; gap: .5rem; }
+    #jobs-list li { display: flex; justify-content: space-between; align-items: center; background: #f8f9fa; padding: .6rem 1rem; border-radius: 6px; }
+    #jobs-list button { background: #dc3545; padding: .4rem .9rem; font-size: .85rem; }
+    #jobs-list button:hover { background: #a71d2a; }
+    .msg { font-size: .85rem; margin-top: .5rem; color: #128c7e; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+
+<header>WhatsApp Scheduler</header>
+
+<main>
+  <!-- Status -->
+  <div class="card">
+    <h2>סטטוס חיבור</h2>
+    <span id="status-badge" class="disconnected">לא מחובר</span>
+    <div id="qr-container" style="margin-top:1rem;display:none;">
+      <p style="margin-bottom:.6rem;font-size:.9rem;">סרוק עם WhatsApp:</p>
+      <img id="qr-img" src="" alt="QR Code" />
+    </div>
+  </div>
+
+  <!-- Send now -->
+  <div class="card">
+    <h2>שלח הודעה עכשיו</h2>
+    <label>מספר טלפון (כולל קידומת מדינה)</label>
+    <input id="send-phone" type="text" placeholder="972501234567" />
+    <label>הודעה</label>
+    <textarea id="send-message" placeholder="הקלד הודעה..."></textarea>
+    <button onclick="sendNow()">שלח</button>
+    <div class="msg" id="send-msg"></div>
+  </div>
+
+  <!-- Schedule -->
+  <div class="card">
+    <h2>תזמן הודעה חוזרת</h2>
+    <label>מזהה משימה</label>
+    <input id="job-id" type="text" placeholder="morning-reminder" />
+    <label>מספר טלפון</label>
+    <input id="job-phone" type="text" placeholder="972501234567" />
+    <label>הודעה</label>
+    <textarea id="job-message" placeholder="הקלד הודעה..."></textarea>
+    <label>Cron Expression (לדוגמה: <code>0 8 * * *</code> = כל יום ב-08:00)</label>
+    <input id="job-cron" type="text" placeholder="0 8 * * *" />
+    <button onclick="scheduleJob()">תזמן</button>
+    <div class="msg" id="schedule-msg"></div>
+  </div>
+
+  <!-- Active jobs -->
+  <div class="card">
+    <h2>משימות פעילות</h2>
+    <ul id="jobs-list"><li style="color:#888;font-size:.9rem;">טוען...</li></ul>
+  </div>
+</main>
+
+<script>
+  async function poll() {
+    try {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      const badge = document.getElementById('status-badge');
+      const qrContainer = document.getElementById('qr-container');
+      if (data.ready) {
+        badge.textContent = 'מחובר';
+        badge.className = 'connected';
+        qrContainer.style.display = 'none';
+      } else {
+        badge.textContent = 'לא מחובר';
+        badge.className = 'disconnected';
+        if (data.hasQr) {
+          const qRes = await fetch('/api/qr');
+          const qData = await qRes.json();
+          if (qData.qr) {
+            document.getElementById('qr-img').src = qData.qr;
+            qrContainer.style.display = 'block';
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadJobs() {
+    try {
+      const res = await fetch('/api/schedules');
+      const data = await res.json();
+      const list = document.getElementById('jobs-list');
+      if (!data.jobs.length) {
+        list.innerHTML = '<li style="color:#888;font-size:.9rem;">אין משימות פעילות</li>';
+        return;
+      }
+      list.innerHTML = data.jobs.map(id => `
+        <li>
+          <span>${id}</span>
+          <button onclick="deleteJob('${id}')">בטל</button>
+        </li>
+      `).join('');
+    } catch (e) { /* ignore */ }
+  }
+
+  async function sendNow() {
+    const phone = document.getElementById('send-phone').value.trim();
+    const message = document.getElementById('send-message').value.trim();
+    const msg = document.getElementById('send-msg');
+    msg.textContent = '';
+    try {
+      const res = await fetch('/api/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, message }),
+      });
+      const data = await res.json();
+      msg.textContent = data.success ? 'ההודעה נשלחה בהצלחה!' : 'שגיאה: ' + data.error;
+    } catch (e) { msg.textContent = 'שגיאה בשליחה'; }
+  }
+
+  async function scheduleJob() {
+    const id = document.getElementById('job-id').value.trim();
+    const phone = document.getElementById('job-phone').value.trim();
+    const message = document.getElementById('job-message').value.trim();
+    const cronExpression = document.getElementById('job-cron').value.trim();
+    const msg = document.getElementById('schedule-msg');
+    msg.textContent = '';
+    try {
+      const res = await fetch('/api/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, phone, message, cronExpression }),
+      });
+      const data = await res.json();
+      msg.textContent = data.success ? 'המשימה תוזמנה בהצלחה!' : 'שגיאה: ' + data.error;
+      loadJobs();
+    } catch (e) { msg.textContent = 'שגיאה בתזמון'; }
+  }
+
+  async function deleteJob(id) {
+    await fetch('/api/schedule/' + id, { method: 'DELETE' });
+    loadJobs();
+  }
+
+  poll();
+  loadJobs();
+  setInterval(poll, 5000);
+  setInterval(loadJobs, 10000);
+</script>
+</body>
+</html>

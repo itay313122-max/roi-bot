@@ -85,10 +85,23 @@ client.on('disconnected', () => {
 function restoreSchedules() {
   const schedules = loadSchedules();
   let restored = 0;
+  const now = Date.now();
+
   for (const s of schedules) {
-    if (s.active && cron.validate(s.cronExpression)) {
-      startCronJob(s);
+    if (s.type === 'once') {
+      if (!s.active || !s.sendAt) continue;
+      const fireAt = new Date(s.sendAt).getTime();
+      if (fireAt <= now) {
+        console.log(`⏩ [${s.id}] one-time sendAt already passed, skipping`);
+        continue;
+      }
+      startOnceJob(s);
       restored++;
+    } else {
+      if (s.active && cron.validate(s.cronExpression)) {
+        startCronJob(s);
+        restored++;
+      }
     }
   }
   console.log(`🔄 Restored ${restored} scheduled jobs`);
@@ -117,6 +130,46 @@ function startCronJob(schedule) {
     }
   });
   activeCronJobs[schedule.id] = task;
+}
+
+// ─── One-time job ─────────────────────────────────────────────────────────
+function startOnceJob(schedule) {
+  if (activeCronJobs[schedule.id]) {
+    activeCronJobs[schedule.id].stop();
+    delete activeCronJobs[schedule.id];
+  }
+
+  const fireAt = new Date(schedule.sendAt);
+  const delay  = fireAt.getTime() - Date.now();
+
+  const timer = setTimeout(async () => {
+    delete activeCronJobs[schedule.id];
+
+    if (!isConnected) {
+      console.error(`❌ [${schedule.id}] One-time fire skipped — not connected`);
+    } else {
+      try {
+        const chatId = formatPhone(schedule.phone);
+        await client.sendMessage(chatId, schedule.message);
+        console.log(`📤 [${schedule.id}] One-time sent to ${schedule.phone}`);
+      } catch (err) {
+        console.error(`❌ [${schedule.id}] One-time failed:`, err.message);
+      }
+    }
+
+    // Remove from store regardless of send success
+    const schedules = loadSchedules();
+    const idx = schedules.findIndex(x => x.id === schedule.id);
+    if (idx !== -1) {
+      schedules[idx].active  = false;
+      schedules[idx].lastSent = new Date().toISOString();
+      schedules[idx].sentCount = (schedules[idx].sentCount || 0) + 1;
+      saveSchedules(schedules);
+    }
+  }, delay);
+
+  // Wrap in a cron-compatible shape so the rest of the code can call .stop()
+  activeCronJobs[schedule.id] = { stop: () => clearTimeout(timer) };
 }
 
 // ─── API Routes ────────────────────────────────────────────────────────────
@@ -212,10 +265,60 @@ app.delete('/api/schedule/:id', (req, res) => {
   res.json({ success: true, deleted: id });
 });
 
+// POST /api/schedule-once
+app.post('/api/schedule-once', (req, res) => {
+  const { id, phone, message, sendAt } = req.body;
+  if (!id || !phone || !message || !sendAt) {
+    return res.status(400).json({ error: 'Missing: id, phone, message, sendAt' });
+  }
+
+  const fireAt = new Date(sendAt);
+  if (isNaN(fireAt.getTime())) {
+    return res.status(400).json({ error: `Invalid sendAt: "${sendAt}" — use ISO 8601 (e.g. "2025-05-22T15:30:00")` });
+  }
+  if (fireAt.getTime() <= Date.now()) {
+    return res.status(400).json({ error: 'sendAt must be in the future' });
+  }
+
+  const schedules = loadSchedules();
+  const existing  = schedules.find(s => s.id === id);
+  if (existing) {
+    if (activeCronJobs[id]) { activeCronJobs[id].stop(); delete activeCronJobs[id]; }
+    existing.phone   = phone.replace(/\D/g, '');
+    existing.message = message;
+    existing.sendAt  = fireAt.toISOString();
+    existing.active  = true;
+    existing.type    = 'once';
+    existing.updatedAt = new Date().toISOString();
+    saveSchedules(schedules);
+    startOnceJob(existing);
+    return res.json({ success: true, schedule: existing, action: 'updated' });
+  }
+
+  const newSchedule = {
+    id,
+    type: 'once',
+    phone: phone.replace(/\D/g, ''),
+    message,
+    sendAt: fireAt.toISOString(),
+    active: true,
+    sentCount: 0,
+    lastSent: null,
+    createdAt: new Date().toISOString(),
+  };
+
+  schedules.push(newSchedule);
+  saveSchedules(schedules);
+  startOnceJob(newSchedule);
+  res.json({ success: true, schedule: newSchedule, action: 'created' });
+});
+
 // GET /api/schedules
 app.get('/api/schedules', (req, res) => {
   const schedules = loadSchedules();
-  res.json(schedules.map(s => ({ ...s, isRunning: !!activeCronJobs[s.id] })));
+  // Return recurring + pending one-time (active ones that haven't fired yet)
+  const visible = schedules.filter(s => s.type !== 'once' || s.active);
+  res.json(visible.map(s => ({ ...s, isRunning: !!activeCronJobs[s.id] })));
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────

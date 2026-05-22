@@ -184,12 +184,15 @@ app.get('/api/qr', (req, res) => {
 
 // POST /api/send
 app.post('/api/send', async (req, res) => {
+  console.log('Send request received:', req.body);
+  console.log('Connected:', isConnected);
   if (!isConnected) return res.status(503).json({ error: 'WhatsApp not connected' });
   const { phone, message } = req.body;
   if (!phone || !message) return res.status(400).json({ error: 'Missing phone or message' });
   try {
     const chatId = formatPhone(phone);
     await client.sendMessage(chatId, message);
+    console.log('Message sent successfully to:', chatId);
     res.json({ success: true, sentTo: chatId });
   } catch (err) {
     res.status(500).json({ error: err.message });

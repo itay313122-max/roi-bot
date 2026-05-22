@@ -160,4 +160,7 @@ app.get('/api/schedules', (req, res) =>
   res.json(loadSchedules().map(s => ({ ...s, isRunning: !!(activeCronJobs[s.id] || activeTimeouts[s.id]) })))
 );
 
-app.listen(PORT, () => { console.log('Server on port', PORT); startWhatsApp(); });
+app.listen(PORT, () => {
+  console.log('Server on port', PORT);
+  startWhatsApp().catch(err => console.error('WhatsApp init error:', err.message, err.stack));
+});

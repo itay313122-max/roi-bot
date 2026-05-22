@@ -13,7 +13,11 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 8080;
-const SCHEDULES_FILE = path.join(__dirname, 'schedules.json');
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const SCHEDULES_FILE = path.join(DATA_DIR, 'schedules.json');
+const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let currentQR = null;
 let isConnected = false;
@@ -46,7 +50,7 @@ async function sendMessage(phone, message) {
 }
 
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: P({ level: 'silent' }) });
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {

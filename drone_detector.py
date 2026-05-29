@@ -19,6 +19,7 @@
 ╚══════════════════════════════════════════════════════════╝
 """
 
+import argparse
 import numpy as np
 import time
 import threading
@@ -980,8 +981,68 @@ def start_web_server(detector: DroneDetector,
     return server
 
 
+# ─── Calibration ──────────────────────────────────────────
+def calibrate(read_frame_fn, duration_s: float = 60.0) -> float:
+    """
+    Measure ambient noise floor for `duration_s` seconds.
+    Collects per-frame RMS, computes median + 3σ gate recommendation.
+    Returns the recommended RMS_GATE value.
+    """
+    print(f"\n{'=' * 58}")
+    print("  CALIBRATION MODE")
+    print(f"  Measuring ambient noise for {int(duration_s)}s.")
+    print("  Keep area clear of drones during calibration.")
+    print(f"{'=' * 58}\n")
+
+    rms_values: list[float] = []
+    t_start    = time.time()
+    t_last_ui  = t_start - 1.0   # force first draw immediately
+    n_frames   = 0
+
+    while time.time() - t_start < duration_s:
+        samples  = read_frame_fn()
+        rms      = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        rms_values.append(rms)
+        n_frames += 1
+        now      = time.time()
+        if now - t_last_ui >= 0.2:
+            t_last_ui = now
+            elapsed   = now - t_start
+            pct       = elapsed / duration_s
+            bar       = "█" * int(pct * 40) + "░" * (40 - int(pct * 40))
+            print(f"\r  [{bar}] {elapsed:4.0f}/{duration_s:.0f}s  frames: {n_frames}", end="", flush=True)
+
+    print()
+
+    rms_arr     = np.array(rms_values, dtype=np.float64)
+    noise_floor = float(np.median(rms_arr))
+    noise_std   = float(np.std(rms_arr))
+    # 3σ above median keeps 99.7 % of ambient noise below gate
+    rms_gate    = noise_floor + 3.0 * noise_std
+    rms_gate    = max(rms_gate, noise_floor * 2.5)   # never less than 2.5× floor
+    rms_gate    = round(rms_gate, 6)
+
+    print(f"\n  CALIBRATION DONE")
+    print(f"  noise floor (median RMS) : {noise_floor:.6f}")
+    print(f"  noise σ                  : {noise_std:.6f}")
+    print(f"  recommended rms_gate     : {rms_gate:.6f}")
+    print(f"\n  To apply: set  RMS_GATE = {rms_gate}  in drone_detector.py")
+    print(f"{'=' * 58}\n")
+
+    return rms_gate
+
+
 # ─── Entry point ──────────────────────────────────────────
 def main():
+    ap = argparse.ArgumentParser(description="Drone Detector v3 — BPF + YOLOv8 fusion")
+    ap.add_argument("--calibrate",    action="store_true",
+                    help="Run noise-floor calibration before starting detection")
+    ap.add_argument("--cal-duration", type=float, default=60.0, metavar="SECS",
+                    help="Calibration duration in seconds (default: 60)")
+    ap.add_argument("--port",         type=int, default=8765,
+                    help="Dashboard HTTP port (default: 8765)")
+    args = ap.parse_args()
+
     print("=" * 58)
     print("  DRONE DETECTOR — POC v3")
     print("  Acoustic BPF + YOLOv8 visual fusion")
@@ -991,7 +1052,7 @@ def main():
     visual   = VisualDetector()
     visual.start()
 
-    port = 8765
+    port = args.port
     start_web_server(detector, visual, port)
     print(f"\n  Dashboard: http://localhost:{port}\n")
 
@@ -1018,6 +1079,9 @@ def main():
         print('  Acoustic: simulation  (FPV 5" → DJI Mavic → Shahed-136, 26s cycle)')
         sim = SimulatedAudio()
         read_frame = sim.read_frame
+
+    if args.calibrate:
+        calibrate(read_frame, duration_s=args.cal_duration)
 
     print("  Ctrl+C to stop\n")
 

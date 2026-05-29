@@ -61,6 +61,19 @@ ALARM_FRAMES  = 2
 RMS_GATE      = 0.0004
 MIN_SNR       = 3.0
 
+# ─── Calibration API state ────────────────────────────────
+_cal_lock  = threading.Lock()
+_cal_state: dict = {
+    "running":     False,
+    "progress":    0.0,
+    "elapsed":     0.0,
+    "duration":    0.0,
+    "frames":      0,
+    "noise_floor": None,
+    "rms_gate":    None,
+}
+_read_frame_fn = None   # set by main() after audio init
+
 # ─── Visual threshold ─────────────────────────────────────
 VISUAL_CONF_THRESHOLD = 0.60   # YOLOv8 confidence to trigger visual alert
 
@@ -940,6 +953,57 @@ poll();
 </html>"""
 
 
+# ─── Calibration API ─────────────────────────────────────
+def _bg_calibrate(duration_s: float) -> None:
+    rms_values = []
+    t0 = time.time()
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= duration_s:
+            break
+        if _read_frame_fn is None:
+            time.sleep(0.01)
+            continue
+        samples = _read_frame_fn()
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        rms_values.append(rms)
+        with _cal_lock:
+            _cal_state.update({
+                "elapsed":  elapsed,
+                "progress": min(elapsed / duration_s, 1.0),
+                "frames":   len(rms_values),
+            })
+    arr  = np.array(rms_values, dtype=np.float64)
+    nf   = float(np.median(arr))
+    std  = float(np.std(arr))
+    gate = round(max(nf + 3.0 * std, nf * 2.5), 6)
+    with _cal_lock:
+        _cal_state.update({
+            "running":     False,
+            "progress":    1.0,
+            "noise_floor": nf,
+            "rms_gate":    gate,
+        })
+
+
+def _start_calibration_api(duration_s: float = 30.0) -> bool:
+    """Start a background calibration run; returns False if one is already running."""
+    with _cal_lock:
+        if _cal_state["running"]:
+            return False
+        _cal_state.update({
+            "running":     True,
+            "progress":    0.0,
+            "elapsed":     0.0,
+            "duration":    duration_s,
+            "frames":      0,
+            "noise_floor": None,
+            "rms_gate":    None,
+        })
+    threading.Thread(target=_bg_calibrate, args=(duration_s,), daemon=True).start()
+    return True
+
+
 # ─── HTTP server ──────────────────────────────────────────
 def start_web_server(detector: DroneDetector,
                      visual: VisualDetector,
@@ -970,11 +1034,37 @@ def start_web_server(detector: DroneDetector,
                     self.send_response(204)
                     self.end_headers()
 
+            elif self.path == "/api/calibrate":
+                with _cal_lock:
+                    data = json.dumps(_cal_state).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+
             else:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(DASHBOARD_HTML.encode())
+
+        def do_POST(self):
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/calibrate":
+                qs  = parse_qs(parsed.query)
+                dur = float(qs.get("duration", [30.0])[0])
+                ok  = _start_calibration_api(dur)
+                resp = json.dumps({"started": ok}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                self.send_response(404)
+                self.end_headers()
 
     server = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1082,6 +1172,9 @@ def main():
 
     if args.calibrate:
         calibrate(read_frame, duration_s=args.cal_duration)
+
+    global _read_frame_fn
+    _read_frame_fn = read_frame
 
     print("  Ctrl+C to stop\n")
 

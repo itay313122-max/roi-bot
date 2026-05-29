@@ -995,15 +995,26 @@ def main():
     start_web_server(detector, visual, port)
     print(f"\n  Dashboard: http://localhost:{port}\n")
 
+    stream    = None
+    p         = None
+    mic_alive = False
     if AUDIO_AVAILABLE:
-        print("  Acoustic: live microphone")
-        p      = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                        input=True, frames_per_buffer=FRAME_SIZE)
-        def read_frame():
-            raw = stream.read(FRAME_SIZE, exception_on_overflow=False)
-            return np.frombuffer(raw, dtype=np.int16)
-    else:
+        try:
+            p         = pyaudio.PyAudio()
+            stream    = p.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+                               input=True, frames_per_buffer=FRAME_SIZE)
+            mic_alive = True
+            print("  Acoustic: live microphone")
+            def read_frame():
+                raw = stream.read(FRAME_SIZE, exception_on_overflow=False)
+                return np.frombuffer(raw, dtype=np.int16)
+        except OSError as e:
+            print(f"  Acoustic: no mic hardware ({e}) — simulation mode")
+            if p:
+                p.terminate()
+            p = stream = None
+
+    if not mic_alive:
         print('  Acoustic: simulation  (FPV 5" → DJI Mavic → Shahed-136, 26s cycle)')
         sim = SimulatedAudio()
         read_frame = sim.read_frame
@@ -1039,9 +1050,10 @@ def main():
 
     except KeyboardInterrupt:
         print("\n\n  Stopped.")
-        if AUDIO_AVAILABLE:
+        if stream:
             stream.stop_stream()
             stream.close()
+        if p:
             p.terminate()
 
 

@@ -20,3 +20,8 @@ build/
 *.pt
 *.onnx
 *.weights
+
+# Session output files (generated at runtime)
+field_test_*.csv
+field_test_report_*.html
+session_*.csv

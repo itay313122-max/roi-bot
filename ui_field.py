@@ -247,7 +247,7 @@ class DroneDetector:
 
         if self.alarm_active and not prev:
             self.total_detections += 1
-            entry = {"time": datetime.now().strftime("%H:%M:%S"), "type": label,
+            entry = {"time": datetime.now().strftime("%H:%M:%S.%f")[:-3], "type": label,
                      "threat": threat, "f0": round(result.get("f0", 0)),
                      "snr": round(result.get("snr", 0), 1),
                      "confidence": round(self.confidence_ema, 2),
@@ -293,10 +293,10 @@ class SimulatedAudio:
     _H = {"FPV_5INCH_RACING": (1.0, 0.55, 0.28, 0.14, 0.07, 0.04),
           "DJI_MAVIC_RECON":  (1.0, 0.40, 0.20, 0.10),
           "SHAHED_136":       (1.0, 0.65, 0.35, 0.20)}
-    _SEG = (( 2.0,  5.0,  700.0,  950.0, 10000, "FPV_5INCH_RACING"),
-            ( 5.0,  7.0,  950.0,  700.0,  8000, "FPV_5INCH_RACING"),
-            (10.0, 14.0,  183.0,  183.0,  8500, "DJI_MAVIC_RECON"),
-            (17.0, 22.0,  242.0,  242.0,  7000, "SHAHED_136"))
+    _SEG = (( 2.0,  5.0,  700.0,  950.0,  120, "FPV_5INCH_RACING"),
+            ( 5.0,  7.0,  950.0,  700.0,   80, "FPV_5INCH_RACING"),
+            (10.0, 14.0,  183.0,  183.0,   95, "DJI_MAVIC_RECON"),
+            (17.0, 22.0,  242.0,  242.0,   85, "SHAHED_136"))
     _CYCLE = 26.0
 
     def __init__(self):

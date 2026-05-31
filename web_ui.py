@@ -522,7 +522,7 @@ body{background:#060a06;color:#00ff41;font-family:'Courier New',monospace;min-he
 .dg{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:.82em}
 .dl{color:#446644}.dv{color:#ccffcc;font-weight:bold}
 /* ── Threat ── */
-#threat{grid-column:1/-1;text-align:center;padding:16px 10px;border:2px solid #1a3a1a;border-radius:3px;transition:border-color .3s,background .4s}
+#threat{grid-column:1/-1;text-align:center;padding:16px 10px;border:2px solid #1a3a1a;border-radius:3px;transition:background .4s}
 #threat.c-CONFIRMED{border-color:#ff0000;background:#120000;animation:pborder .8s infinite}
 #threat.c-ACOUSTIC{border-color:#ffaa00;background:#0e0d00}
 #threat.c-VISUAL{border-color:#4488ff;background:#00000e}
@@ -534,6 +534,8 @@ body{background:#060a06;color:#00ff41;font-family:'Courier New',monospace;min-he
 #thr-txt.c-VISUAL{color:#4488ff}
 #thr-txt.c-CLEAR{color:#00ff41}
 @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:.25}}
+@keyframes wiz-blink{0%,100%{opacity:1}50%{opacity:.25}}
+.blink-step .ws-icon{animation:wiz-blink .9s infinite}
 #thr-dir{font-size:1em;color:#aaa;margin-top:4px}
 #thr-range{font-size:.85em;color:#446644;margin-top:3px}
 /* ── Canvas row ── */
@@ -543,8 +545,8 @@ canvas{display:block;width:100%;border-radius:2px}
 #log-block{grid-column:1/-1}
 #log-ul{list-style:none;max-height:150px;overflow-y:auto;font-size:.75em}
 #log-ul::-webkit-scrollbar{width:3px}#log-ul::-webkit-scrollbar-thumb{background:#1a3a1a}
-.le{padding:3px 0;border-bottom:1px solid #0a120a;display:grid;grid-template-columns:58px 180px 68px 72px 150px auto;gap:3px}
-.le.confirmed{color:#ff4444}.le.acoustic{color:#ffaa00}.le.visual{color:#5599ff}.le.clear{color:#446644}
+.le{padding:3px 4px;border-bottom:1px solid #0a120a;display:grid;grid-template-columns:82px 180px 68px 72px 150px auto;gap:3px;border-radius:2px}
+.le.confirmed{color:#ff4444;background:rgba(255,0,0,0.15)}.le.acoustic{color:#ffaa00;background:rgba(255,200,0,0.10)}.le.visual{color:#5599ff;background:rgba(0,100,255,0.10)}.le.clear{color:#446644}
 /* ── Controls ── */
 #ctrls{grid-column:1/-1;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 button{background:#0a120a;border:1px solid #00ff41;color:#00ff41;padding:7px 14px;
@@ -586,7 +588,7 @@ button.wiz-btn:hover{background:#0a0a20}
 .ws-pfill{height:100%;background:#00ff41;transition:width .5s}
 /* instruction box */
 #wiz-instr{background:#040d04;border:1px solid #00ff4144;border-radius:3px;padding:10px 12px;
-           font-size:.82em;line-height:1.5;color:#99ccaa;text-align:right}
+           font-size:.82em;line-height:1.5;color:#99ccaa;text-align:right;direction:rtl}
 /* wiz controls */
 #wiz-ctrls{display:flex;gap:6px;padding:0 0 4px 0;flex-wrap:wrap}
 #wiz-ctrls button{font-size:.78em;padding:6px 12px}
@@ -697,8 +699,8 @@ button.wiz-btn:hover{background:#0a0a20}
     <button id="wiz-close" onclick="closeWizard()" title="Close">✕</button>
   </div>
   <div id="wiz-body">
-    <div id="wiz-not-started" style="color:#446644;font-size:.85em;text-align:center;padding:20px">
-      לחץ BEGIN WIZARD להתחלת בדיקת שטח מודרכת
+    <div id="wiz-not-started" style="color:#446644;font-size:.85em;text-align:right;direction:rtl;padding:10px 12px;border-bottom:1px solid #1a3a1a;margin-bottom:4px">
+      לחץ ▶▶ BEGIN WIZARD להתחלת בדיקת שדה מודרכת
     </div>
     <div id="wiz-steps" style="display:none"></div>
     <div id="wiz-instr" style="display:none"></div>
@@ -713,6 +715,28 @@ button.wiz-btn:hover{background:#0a0a20}
 </div>
 
 <script>
+// ── Audio alerts (Web Audio API) ─────────────────────────────────────
+let _audioCtx = null, _prevThreat = 'CLEAR';
+function _initAudio() {
+  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (_audioCtx.state === 'suspended') _audioCtx.resume();
+}
+function _beep(freq, dur, vol) {
+  try {
+    _initAudio();
+    const o = _audioCtx.createOscillator(), g = _audioCtx.createGain();
+    o.connect(g); g.connect(_audioCtx.destination);
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, _audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + dur);
+    o.start(); o.stop(_audioCtx.currentTime + dur);
+  } catch(e) {}
+}
+document.addEventListener('click', _initAudio);
+
+// ── Radar RAF state ───────────────────────────────────────────────────
+let _lastRadar = {direction:'STABLE', rate:0, range:'', alarm:false};
+
 // ── WebSocket ────────────────────────────────────────────────────────
 let ws, reconnTimer, lastLogJSON = "";
 
@@ -789,6 +813,13 @@ function update(d) {
   document.getElementById('thr-dir').textContent  = `Direction: ${DIR[d.direction] || d.direction}${rate}`;
   document.getElementById('thr-range').textContent = `Est. Range: ${d.range_estimate || '—'}`;
 
+  // sound alert on threat change
+  if (d.combined_threat !== _prevThreat) {
+    if (d.combined_threat === 'CONFIRMED')     _beep(880, 0.4, 0.3);
+    if (d.combined_threat === 'ACOUSTIC ONLY') _beep(440, 0.25, 0.2);
+    _prevThreat = d.combined_threat;
+  }
+
   // stats
   document.getElementById('stats-r').textContent =
     `frames: ${d.frames.toLocaleString()} | detections: ${d.detections}`;
@@ -826,7 +857,7 @@ function update(d) {
 
   // canvases
   drawHistory(d.history || [], d.acoustic_confidence, d.alarm);
-  drawRadar(d.direction, d.direction_rate, d.range_estimate);
+  _lastRadar = {direction:d.direction, rate:d.direction_rate, range:d.range_estimate, alarm:d.alarm};
 
   // wizard
   if (d.wizard) updateWizard(d.wizard);
@@ -895,7 +926,7 @@ function drawHistory(hist, curConf, alarm) {
 }
 
 // ── Direction radar canvas ───────────────────────────────────────────
-function drawRadar(direction, rate, range) {
+function drawRadar(direction, rate, range, alarm) {
   const cv = document.getElementById('radar-cv');
   const card = document.getElementById('radar-card');
   const W = card.clientWidth - 24;
@@ -929,19 +960,34 @@ function drawRadar(direction, rate, range) {
 
   if (direction === 'STABLE') {
     ctx.beginPath(); ctx.arc(cx,cy,r*.18,0,2*Math.PI);
-    ctx.strokeStyle='#00ff41'; ctx.lineWidth=2; ctx.stroke();
-    ctx.fillStyle='#00ff4122'; ctx.fill();
-    ctx.fillStyle='#00ff41'; ctx.font='bold 8px Courier New'; ctx.textAlign='center';
+    ctx.strokeStyle = alarm ? '#00ff41' : '#224422'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle = alarm ? '#00ff4122' : '#0a180a'; ctx.fill();
+    ctx.fillStyle = alarm ? '#00ff41' : '#224422';
+    ctx.font='bold 8px Courier New'; ctx.textAlign='center';
     ctx.fillText('STABLE',cx,cy+4); return;
   }
 
-  const ang   = direction==='APPROACHING' ? -Math.PI/2 : Math.PI/2;
-  const color = direction==='APPROACHING' ? '#ff2a2a' : '#ffaa00';
-  const alen  = r * (direction==='APPROACHING' ? .82 : .72);
+  const isHot   = alarm && direction === 'APPROACHING';
+  const isWarm  = alarm && direction === 'RECEDING';
+  const baseClr = direction === 'APPROACHING' ? '#ff2a2a' : '#ffaa00';
+  const dimClr  = direction === 'APPROACHING' ? 'rgba(255,42,42,0.22)' : 'rgba(255,170,0,0.22)';
+  const color   = (isHot || isWarm) ? baseClr : dimClr;
+  const lineW   = (isHot || isWarm) ? 2.5 : 1.2;
+
+  let shadowBlur = 0;
+  if (isHot) {
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 200);
+    shadowBlur = 8 + 20 * pulse;
+  } else if (isWarm) {
+    shadowBlur = 6;
+  }
+
+  const ang  = direction === 'APPROACHING' ? -Math.PI/2 : Math.PI/2;
+  const alen = r * (direction === 'APPROACHING' ? .82 : .72);
   const tx=cx+Math.cos(ang)*alen, ty=cy+Math.sin(ang)*alen;
 
-  ctx.shadowColor=color; ctx.shadowBlur=10;
-  ctx.strokeStyle=color; ctx.lineWidth=2.5;
+  ctx.shadowColor=baseClr; ctx.shadowBlur=shadowBlur;
+  ctx.strokeStyle=color; ctx.lineWidth=lineW;
   ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(tx,ty); ctx.stroke();
   ctx.shadowBlur=0;
 
@@ -957,13 +1003,21 @@ function drawRadar(direction, rate, range) {
   ctx.fillText(direction, cx, cy+r-12);
 }
 
+function startRadarLoop() {
+  (function loop() {
+    drawRadar(_lastRadar.direction, _lastRadar.rate, _lastRadar.range, _lastRadar.alarm);
+    requestAnimationFrame(loop);
+  })();
+}
+
 // ── Controls ─────────────────────────────────────────────────────────
 function doCalibrate() { fetch('/calibrate',{method:'POST'}); }
 function doLog()       { fetch('/log/toggle',{method:'POST'}); }
 function doReset()     { fetch('/reset',{method:'POST'}); }
 
 // ── Wizard ───────────────────────────────────────────────────────────
-const STEP_ICONS = {pending:'○',waiting:'◎',running:'◉',pass:'✅',fail:'❌',skip:'⏭️'};
+const STEP_ICONS = {pending:'⬜',waiting:'⬜',running:'🔵',pass:'✅',fail:'❌',skip:'⏭️'};
+const STEP_DNAMES = ['BASELINE','DETECTION','DOPPLER','RANGE 50m','MULTI-TYPE','VISUAL','REPORT'];
 const STEP_COLORS = {pending:'#224422',waiting:'#446644',running:'#00ff41',pass:'#00aa33',fail:'#ff2a2a',skip:'#445544'};
 
 function openWizard()  { document.getElementById('wiz-panel').classList.add('open'); }
@@ -981,42 +1035,45 @@ function updateWizard(wiz) {
   const reportDiv  = document.getElementById('wiz-report');
   const btnStart   = document.getElementById('btn-wiz-start');
 
-  if (!wiz.active) {
-    notStarted.style.display='';
-    stepsDiv.style.display='none';
-    instrDiv.style.display='none';
-    ctrlsDiv.style.display='none';
-    reportDiv.style.display='none';
-    btnStart.style.display='';
-    return;
-  }
-
-  notStarted.style.display='none';
-  btnStart.style.display='none';
-  stepsDiv.style.display='';
-
-  // Build/update step list
-  const results = wiz.results || {};
+  // Always render step list
+  const results = wiz.active ? (wiz.results || {}) : {};
   let html = '';
-  for (let i=1; i<=7; i++) {
-    const r   = results[i] || {};
-    const st  = r.status || 'pending';
-    const isCurrent = i === wiz.current_step;
-    const icon = STEP_ICONS[st] || '○';
-    const color = STEP_COLORS[st] || '#224422';
-    const isRunning = st === 'running';
-    const progress = (isCurrent && isRunning) ? wiz.progress * 100 : (st === 'pass' || st === 'skip' ? 100 : 0);
-    const cls = `wstep ${st} ${isCurrent?'current':''}`;
-    html += `<div class="${cls}" style="border-color:${isCurrent?color:'#1a3a1a'}">
+  for (let i = 1; i <= 7; i++) {
+    const r          = results[i] || {};
+    const st         = r.status || 'pending';
+    const isCurrent  = wiz.active && i === wiz.current_step;
+    const isCurAct   = isCurrent && (st === 'waiting' || st === 'running');
+    const icon       = isCurAct ? '🔵' : (STEP_ICONS[st] || '⬜');
+    const blinkCls   = isCurAct ? ' blink-step' : '';
+    const color      = STEP_COLORS[st] || '#224422';
+    const nameColor  = isCurrent ? color : '#446644';
+    const isRunning  = st === 'running' && isCurrent;
+    const progress   = (isRunning && wiz.duration > 0) ? wiz.progress * 100
+                       : (st === 'pass' || st === 'skip') ? 100 : 0;
+    const bdrStyle   = isCurrent ? `border-color:${color}` : '';
+    html += `<div class="wstep ${st}${blinkCls}" style="${bdrStyle}">
       <div class="ws-icon" style="color:${color}">${icon}</div>
       <div class="ws-info">
-        <div class="ws-name" style="color:${isCurrent?color:'#446644'}">${r.name||'STEP '+i}</div>
-        ${r.message?`<div class="ws-msg">${r.message}</div>`:''}
-        ${isRunning&&wiz.duration>0?`<div class="ws-pbar"><div class="ws-pfill" style="width:${progress.toFixed(1)}%;background:${color}"></div></div>`:''}
+        <div class="ws-name" style="color:${nameColor}">${STEP_DNAMES[i-1]}</div>
+        ${r.message ? `<div class="ws-msg">${r.message}</div>` : ''}
+        ${isRunning && wiz.duration > 0 ? `<div class="ws-pbar"><div class="ws-pfill" style="width:${progress.toFixed(1)}%"></div></div>` : ''}
       </div>
     </div>`;
   }
   stepsDiv.innerHTML = html;
+  stepsDiv.style.display = '';
+
+  if (!wiz.active) {
+    notStarted.style.display = '';
+    instrDiv.style.display   = 'none';
+    ctrlsDiv.style.display   = 'none';
+    reportDiv.style.display  = 'none';
+    btnStart.style.display   = '';
+    return;
+  }
+
+  notStarted.style.display = 'none';
+  btnStart.style.display   = 'none';
 
   // Instruction
   if (wiz.instruction && wiz.current_step < 7) {
@@ -1027,30 +1084,30 @@ function updateWizard(wiz) {
   }
 
   // Controls
-  const curStatus = (results[wiz.current_step]||{}).status || 'pending';
+  const curStatus = (results[wiz.current_step] || {}).status || 'pending';
   if (wiz.current_step <= 6) {
     ctrlsDiv.style.display = 'flex';
-    document.getElementById('btn-wiz-begin').style.display = curStatus==='waiting'?'':'none';
-    document.getElementById('btn-wiz-skip').style.display  = wiz.skippable?'':'none';
-    document.getElementById('btn-wiz-retry').style.display = curStatus==='fail'?'':'none';
+    document.getElementById('btn-wiz-begin').style.display = curStatus === 'waiting' ? '' : 'none';
+    document.getElementById('btn-wiz-skip').style.display  = wiz.skippable ? '' : 'none';
+    document.getElementById('btn-wiz-retry').style.display = curStatus === 'fail' ? '' : 'none';
   } else {
     ctrlsDiv.style.display = 'none';
   }
 
   // Report
-  const repData = (results[7]||{});
+  const repData = (results[7] || {});
   if (repData.status === 'pass' && repData.message) {
     reportDiv.style.display = '';
-    const path = repData.message.replace('דוח שמור: ','');
-    reportDiv.innerHTML = `<div>${repData.overall||''}</div>
+    const path = repData.message.replace('דוח שמור: ', '');
+    reportDiv.innerHTML = `<div>${repData.overall || ''}</div>
       <a href="/${path}" target="_blank">📄 פתח דוח מלא</a>`;
   } else {
     reportDiv.style.display = 'none';
   }
 }
 
-// Serve report files
-window.addEventListener('resize', () => { drawHistory([],0,false); drawRadar('STABLE',0,''); });
+window.addEventListener('resize', () => { drawHistory([], 0, false); });
+startRadarLoop();
 connect();
 </script>
 </body>

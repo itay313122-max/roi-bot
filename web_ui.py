@@ -484,14 +484,9 @@ async def _broadcast_loop():
         _clients.difference_update(dead)   # in-place remove, no assignment
 
 
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def _lifespan(app):
+@app.on_event("startup")
+async def _startup():
     asyncio.create_task(_broadcast_loop())
-    yield
-
-app.router.lifespan_context = _lifespan
 
 
 # ─── HTML / CSS / JS ───────────────────────────────────────────────────

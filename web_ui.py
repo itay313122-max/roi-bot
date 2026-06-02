@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import sys
 import threading
 import time
@@ -123,6 +124,22 @@ def _range_est(snr: float, alarm: bool) -> str:
     if snr >= 15: return "NEAR  (<50m)"
     if snr >= 8:  return "MEDIUM  (50–200m)"
     return "FAR  (>200m)"
+
+
+_RANGE_METRES = {"NEAR  (<50m)": 50, "MEDIUM  (50–200m)": 150, "FAR  (>200m)": 400}
+
+
+def _offset_position(lat: float, lon: float, bearing_deg: float, dist_m: float) -> tuple:
+    """Return (lat2, lon2) at dist_m metres from (lat, lon) along bearing_deg."""
+    R    = 6371000.0
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    b    = math.radians(bearing_deg)
+    lat2 = math.asin(math.sin(lat1) * math.cos(dist_m / R) +
+                     math.cos(lat1) * math.sin(dist_m / R) * math.cos(b))
+    lon2 = lon1 + math.atan2(math.sin(b) * math.sin(dist_m / R) * math.cos(lat1),
+                              math.cos(dist_m / R) - math.sin(lat1) * math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
 
 
 _CSV_FIELDS = ["timestamp", "acoustic_confidence", "visual_confidence",
@@ -544,6 +561,9 @@ _csv_rows   = 0
 
 _cal_prev_running = False
 
+_user_lat = 0.0
+_user_lon = 0.0
+
 
 # ─── Field Test Wizard ────────────────────────────────────────────────
 
@@ -826,12 +846,21 @@ async def root():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    global _user_lat, _user_lon
     await ws.accept()
     _clients.add(ws)
     try:
-        while True:
-            await asyncio.sleep(60)   # keep-alive; messages sent by broadcaster
+        async for raw in ws.iter_text():
+            try:
+                msg = json.loads(raw)
+                if msg.get("type") == "location":
+                    _user_lat = float(msg.get("lat", 0.0))
+                    _user_lon = float(msg.get("lon", 0.0))
+            except Exception:
+                pass
     except (WebSocketDisconnect, Exception):
+        pass
+    finally:
         _clients.discard(ws)
 
 
@@ -926,6 +955,18 @@ async def _broadcast_loop():
         _wizard.tick(s)
 
         vis = s.get("visual") or {}
+
+        # Drone geo position estimate
+        _re      = _range_est(s.get("snr", 0.0), s.get("alarm", False))
+        _rad_m   = _RANGE_METRES.get(_re, 150)
+        _alarm   = s.get("alarm", False)
+        _dir     = s.get("rpm_trend", "STABLE")
+        _bearing = {"APPROACHING": 0, "RECEDING": 180, "STABLE": 0}.get(_dir, 0)
+        if _alarm and _user_lat != 0.0:
+            _dlat, _dlon = _offset_position(_user_lat, _user_lon, _bearing, _rad_m)
+        else:
+            _dlat, _dlon, _rad_m = 0.0, 0.0, 0
+
         payload = {
             "acoustic_confidence": s.get("confidence", 0.0) / 100.0,
             "visual_confidence":   vis.get("confidence", 0.0) / 100.0,
@@ -951,6 +992,11 @@ async def _broadcast_loop():
             "cal_progress":        round(cal.get("progress", 0.0), 3),
             "visual":              vis,
             "wizard":              _wizard.get_state(),
+            "user_lat":            _user_lat,
+            "user_lon":            _user_lon,
+            "drone_lat":           _dlat,
+            "drone_lon":           _dlon,
+            "drone_radius_m":      _rad_m,
         }
         msg  = json.dumps(payload)
         dead = set()
@@ -975,6 +1021,7 @@ _HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FPV DETECT v3.0 — Web HUD</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#060a06;color:#00ff41;font-family:'Courier New',monospace;min-height:100vh;overflow-x:hidden}
@@ -1081,14 +1128,20 @@ button.wiz-btn:hover{background:#0a0a20}
 #wiz-report a:hover{text-decoration:underline}
 /* ws status */
 .ws-ok{color:#00ff41}.ws-err{color:#ff2a2a;animation:blink 1s infinite}
+/* ── Map panel ── */
+#map-block{grid-column:1/-1}
+#map-container{width:100%;height:280px;border-radius:2px;background:#0a120a;display:none}
+#map-msg{color:#446644;font-size:.8em;padding:8px 0;text-align:center;display:block}
+.map-tiles{filter:brightness(.7) invert(1) hue-rotate(170deg) saturate(0.5)}
 /* responsive */
 @media(max-width:680px){
   #wrap{grid-template-columns:1fr}
-  #threat,#canvas-row,#log-block,#ctrls{grid-column:1}
+  #threat,#canvas-row,#log-block,#map-block,#ctrls{grid-column:1}
   #canvas-row{grid-template-columns:1fr}
   #wiz-panel{width:100%;right:-100%}
 }
 </style>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 
@@ -1147,6 +1200,13 @@ button.wiz-btn:hover{background:#0a0a20}
       <div class="card-title">DIRECTION</div>
       <canvas id="radar-cv" height="130"></canvas>
     </div>
+  </div>
+
+  <!-- Map panel -->
+  <div class="card" id="map-block">
+    <div class="card-title">LIVE POSITION MAP</div>
+    <div id="map-container"></div>
+    <div id="map-msg">📍 ENABLE LOCATION TO SEE MAP</div>
   </div>
 
   <!-- Event log -->
@@ -1339,6 +1399,9 @@ function update(d) {
 
   // wizard
   if (d.wizard) updateWizard(d.wizard);
+
+  // map
+  _updateMap(d);
 }
 
 function setBar(barId, lblId, pct, cls) {
@@ -1584,8 +1647,106 @@ function updateWizard(wiz) {
   }
 }
 
-window.addEventListener('resize', () => { drawHistory([], 0, false); });
+// ── Map ──────────────────────────────────────────────────────────────
+let _map = null, _userMarker = null, _droneMarker = null;
+let _droneCircle = null, _droneTrail = null, _trailPts = [];
+
+function _initMap(lat, lon) {
+  if (_map) return;
+  const el = document.getElementById('map-container');
+  el.style.display = 'block';
+  document.getElementById('map-msg').style.display = 'none';
+
+  _map = L.map('map-container', {zoomControl: true, attributionControl: false}).setView([lat, lon], 16);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, className: 'map-tiles'
+  }).addTo(_map);
+
+  const userIcon = L.divIcon({html:'📍', className:'', iconSize:[24,24], iconAnchor:[12,24]});
+  _userMarker = L.marker([lat, lon], {icon: userIcon, zIndexOffset: 1000})
+    .bindTooltip('YOU', {permanent: false, direction:'top'})
+    .addTo(_map);
+
+  const droneIcon = L.divIcon({html:'🚁', className:'', iconSize:[24,24], iconAnchor:[12,24]});
+  _droneMarker = L.marker([lat, lon], {icon: droneIcon, opacity: 0}).addTo(_map);
+
+  _droneCircle = L.circle([lat, lon], {
+    radius: 0, color: '#ff2a2a', fillColor: '#ff2a2a',
+    fillOpacity: 0.10, weight: 2, opacity: 0
+  }).addTo(_map);
+
+  _droneTrail = L.polyline([], {
+    color: '#ff4444', weight: 2, opacity: 0.7, dashArray: '4 6'
+  }).addTo(_map);
+}
+
+function _updateMap(d) {
+  const uLat = d.user_lat || 0, uLon = d.user_lon || 0;
+  const dLat = d.drone_lat || 0, dLon = d.drone_lon || 0;
+  const dRad = d.drone_radius_m || 0;
+
+  if (!uLat && !uLon) return;  // no geolocation yet
+
+  if (!_map) _initMap(uLat, uLon);
+
+  // update user marker
+  if (_userMarker) _userMarker.setLatLng([uLat, uLon]);
+
+  // drone visible?
+  if (dLat !== 0 && dLon !== 0 && dRad > 0) {
+    if (_droneMarker) {
+      _droneMarker.setLatLng([dLat, dLon]);
+      _droneMarker.setOpacity(1);
+    }
+    if (_droneCircle) {
+      _droneCircle.setLatLng([dLat, dLon]);
+      _droneCircle.setRadius(dRad);
+      _droneCircle.setStyle({opacity: 0.9});
+    }
+    // trail
+    _trailPts.push([dLat, dLon]);
+    if (_trailPts.length > 10) _trailPts.shift();
+    if (_droneTrail) _droneTrail.setLatLngs(_trailPts);
+  } else {
+    // CLEAR — hide drone marker
+    if (_droneMarker) _droneMarker.setOpacity(0);
+    if (_droneCircle) _droneCircle.setStyle({opacity: 0});
+    if (_droneTrail) _droneTrail.setLatLngs([]);
+    _trailPts = [];
+  }
+}
+
+function _startGeo() {
+  const msg = document.getElementById('map-msg');
+  if (!navigator.geolocation) {
+    msg.style.display = 'block';
+    msg.textContent = '📍 GEOLOCATION NOT SUPPORTED';
+    return;
+  }
+  msg.style.display = 'block';
+  msg.textContent = '📍 ENABLE LOCATION TO SEE MAP';
+  navigator.geolocation.watchPosition(
+    pos => {
+      const lat = pos.coords.latitude, lon = pos.coords.longitude;
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({type: 'location', lat, lon}));
+      }
+      msg.style.display = 'none';
+    },
+    err => {
+      msg.style.display = 'block';
+      msg.textContent = '📍 LOCATION DENIED — enable in browser';
+    },
+    {enableHighAccuracy: true, maximumAge: 5000, timeout: 10000}
+  );
+}
+
+window.addEventListener('resize', () => {
+  drawHistory([], 0, false);
+  if (_map) _map.invalidateSize();
+});
 startRadarLoop();
+_startGeo();
 connect();
 </script>
 </body>

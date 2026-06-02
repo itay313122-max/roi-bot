@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 web_ui.py — FPV Drone Detector — Web HUD + Field Test Wizard
-Single file: FastAPI + WebSocket + embedded HTML/CSS/JS.
-Imports detector logic from ui_field.py (must be in same directory).
+Completely standalone: all detector logic embedded, no external dependencies
+beyond fastapi/uvicorn/numpy.  Works on Linux, macOS, and Windows.
 
-Install: pip install fastapi uvicorn websockets
+Install: pip install fastapi uvicorn websockets numpy
+         pip install pyaudio        # optional: live microphone
+         pip install ultralytics    # optional: YOLOv8 visual layer
+         pip install opencv-python  # optional: webcam
 
 Usage:
   python web_ui.py                 # auto-detect hardware
@@ -34,18 +37,492 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import ui_field as _uf
-    from ui_field import (
-        DroneDetector, SimulatedAudio, VisualDetector, _AudioThread,
-        _start_inline_calibration, _get_cal, _calibrate_terminal,
-        _csv_row, _CSV_FIELDS, FRAME_SIZE, SAMPLE_RATE, VERSION, _range_est,
-    )
-except ImportError as e:
-    print(f"ERROR: cannot import ui_field.py — {e}")
-    print("Make sure ui_field.py is in the same directory.")
+    import numpy as np
+except ImportError:
+    print("ERROR: pip install numpy")
     sys.exit(1)
 
-import numpy as np
+from collections import deque
+
+# ─── Acoustic constants ───────────────────────────────────────────────
+
+SAMPLE_RATE   = 16000
+FRAME_SIZE    = 1024
+SCAN_MIN_HZ   = 80
+SCAN_MAX_HZ   = 1600
+H2_RATIO_MIN  = 0.07
+H3_RATIO_MIN  = 0.035
+EMA_ALPHA     = 0.25
+ALARM_FRAMES  = 2
+RMS_GATE      = 0.0004      # updated by calibration
+MIN_SNR       = 3.0
+VISUAL_THRESH = 0.60
+VERSION       = "3.0"
+CAL_SECS      = 30
+
+# ─── Drone database ───────────────────────────────────────────────────
+
+DRONE_DATABASE = {
+    "FPV_5INCH_RACING": {
+        "label": 'FPV 5" Racing (Kamikaze)', "f0_range": (667, 1200),
+        "harmonics": 6, "snr_threshold": 6.0, "num_blades": 2, "threat": "HIGH",
+    },
+    "FPV_3INCH_MICRO": {
+        "label": 'FPV 3" Micro (Suicide)', "f0_range": (833, 1500),
+        "harmonics": 5, "snr_threshold": 5.0, "num_blades": 2, "threat": "HIGH",
+    },
+    "FPV_7INCH_LR": {
+        "label": 'FPV 7" Long Range', "f0_range": (400, 733),
+        "harmonics": 5, "snr_threshold": 5.0, "num_blades": 2, "threat": "HIGH",
+    },
+    "DJI_MAVIC_RECON": {
+        "label": "DJI Mavic (Recon / ISR)", "f0_range": (150, 217),
+        "harmonics": 4, "snr_threshold": 4.0, "num_blades": 2, "threat": "MEDIUM",
+    },
+    "DJI_MATRICE_HEAVY": {
+        "label": "DJI Matrice (Heavy Lift)", "f0_range": (100, 167),
+        "harmonics": 4, "snr_threshold": 3.0, "num_blades": 2, "threat": "MEDIUM",
+    },
+    "SHAHED_136": {
+        "label": "Shahed-136 / Geran-2", "f0_range": (200, 283),
+        "harmonics": 4, "snr_threshold": 3.0, "num_blades": 2, "threat": "CRITICAL",
+    },
+    "LANCET_LOITERING": {
+        "label": "Lancet Loitering Munition", "f0_range": (267, 500),
+        "harmonics": 4, "snr_threshold": 4.0, "num_blades": 2, "threat": "HIGH",
+    },
+}
+
+
+def _classify_drone(f0: float, snr: float, harmonics: int) -> tuple:
+    best_key, best_score, best_rpm = None, 0.0, 0
+    for key, p in DRONE_DATABASE.items():
+        lo, hi = p["f0_range"]
+        if not (lo <= f0 <= hi) or snr < p["snr_threshold"]:
+            continue
+        center     = (lo + hi) / 2.0
+        centrality = 1.0 - abs(f0 - center) / ((hi - lo) / 2.0)
+        snr_score  = min(snr / (p["snr_threshold"] * 3.0), 1.0)
+        h_score    = min(harmonics / p["harmonics"], 1.0)
+        score      = centrality * 0.4 + snr_score * 0.4 + h_score * 0.2
+        if score > best_score:
+            best_score, best_key = score, key
+            best_rpm = int(f0 * 60 / p["num_blades"])
+    return best_key, best_score, best_rpm
+
+
+def _combined_threat(acoustic: bool, visual: bool) -> str:
+    if acoustic and visual: return "CONFIRMED"
+    if acoustic:            return "ACOUSTIC ONLY"
+    if visual:              return "VISUAL ONLY"
+    return "CLEAR"
+
+
+def _range_est(snr: float, alarm: bool) -> str:
+    if not alarm or snr <= 0: return "—"
+    if snr >= 15: return "NEAR  (<50m)"
+    if snr >= 8:  return "MEDIUM  (50–200m)"
+    return "FAR  (>200m)"
+
+
+_CSV_FIELDS = ["timestamp", "acoustic_confidence", "visual_confidence",
+               "combined_threat", "f0_hz", "rpm_estimate",
+               "drone_type", "direction", "distance_phase"]
+_DP = {"APPROACHING": "INBOUND", "RECEDING": "OUTBOUND", "STABLE": "HOVER/OVERHEAD"}
+
+
+def _csv_row(s: dict) -> dict:
+    v     = (s or {}).get("visual") or {}
+    trend = s.get("rpm_trend", "STABLE")
+    return {"timestamp":           datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            "acoustic_confidence": round(s.get("confidence", 0.0), 1),
+            "visual_confidence":   round(v.get("confidence", 0.0), 1),
+            "combined_threat":     s.get("combined_threat", "CLEAR"),
+            "f0_hz":               s.get("f0_hz", 0),
+            "rpm_estimate":        s.get("rpm_est", 0),
+            "drone_type":          s.get("profile_label", "—"),
+            "direction":           trend,
+            "distance_phase":      _DP.get(trend, "N/A")}
+
+
+# ─── Acoustic detector ────────────────────────────────────────────────
+
+class DroneDetector:
+    def __init__(self):
+        self.confidence_ema   = 0.0
+        self.alarm_count      = 0
+        self.alarm_active     = False
+        self.detection_log    = []
+        self.history          = deque(maxlen=100)
+        self.f0_window        = deque(maxlen=10)
+        self.frame_count      = 0
+        self.total_detections = 0
+        self._lock            = threading.Lock()
+        self._state           = {
+            "status": "MONITORING", "confidence": 0.0, "alarm": False,
+            "f0_hz": 0, "snr": 0.0, "profile_label": "—", "threat": "LOW",
+            "rpm_est": 0, "rpm_trend": "STABLE", "rate_hz_per_s": 0.0,
+            "history": [], "log": [], "frames": 0, "detections": 0,
+            "combined_threat": "CLEAR", "visual": {},
+        }
+
+    def _f0_drift(self) -> tuple:
+        vals = list(self.f0_window)
+        if not vals:
+            return 0.0, "STABLE", 0.0
+        n        = len(vals)
+        weights  = list(range(1, n + 1))
+        smoothed = sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+        if n < 4:
+            return smoothed, "STABLE", 0.0
+        mid           = n // 2
+        rate_hz_per_s = (sum(vals[mid:]) / (n - mid) - sum(vals[:mid]) / mid) \
+                        / (mid * (FRAME_SIZE / SAMPLE_RATE))
+        trend = ("APPROACHING" if rate_hz_per_s > 15
+                 else "RECEDING" if rate_hz_per_s < -15
+                 else "STABLE")
+        return smoothed, trend, rate_hz_per_s
+
+    def analyze_frame(self, samples: np.ndarray) -> dict:
+        self.frame_count += 1
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        if rms < RMS_GATE:
+            return {"detected": False, "confidence": 0.0}
+
+        x     = samples.astype(np.float32) / 32768.0
+        fft   = np.fft.rfft(x * np.hanning(len(x)), n=FRAME_SIZE)
+        psd   = np.abs(fft) ** 2
+        freqs = np.fft.rfftfreq(FRAME_SIZE, 1.0 / SAMPLE_RATE)
+
+        mask     = (freqs >= SCAN_MIN_HZ) & (freqs <= SCAN_MAX_HZ)
+        scan     = psd.copy(); scan[~mask] = 0.0
+        peak_bin = np.argmax(scan)
+        f0       = float(freqs[peak_bin])
+        p_f0     = float(psd[peak_bin])
+        snr      = p_f0 / (float(np.median(psd[mask])) + 1e-12)
+
+        if snr < MIN_SNR:
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+
+        hw = max(SAMPLE_RATE / FRAME_SIZE * 2, f0 * 0.07)
+
+        def _pw(hz):
+            m = (freqs >= hz - hw) & (freqs <= hz + hw)
+            return float(np.max(psd[m])) if np.any(m) else 0.0
+
+        h2 = _pw(f0 * 2) / (p_f0 + 1e-12)
+        h3 = _pw(f0 * 3) / (p_f0 + 1e-12)
+        if h2 < H2_RATIO_MIN or h3 < H3_RATIO_MIN:
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+
+        n_harm = 2 + sum(1 for k in range(4, 9)
+                         if _pw(f0 * k) / (p_f0 + 1e-12) >= 0.02)
+        key, match, rpm = _classify_drone(f0, snr, n_harm)
+        if key is None:
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+
+        p    = DRONE_DATABASE[key]
+        conf = min((min(snr / (p["snr_threshold"] * 3.0), 1.0) * 0.5
+                    + min(h2 / 0.3, 1.0) * 0.3
+                    + min(h3 / 0.15, 1.0) * 0.2) * 0.7 + match * 0.3, 1.0)
+        return {"detected": True, "confidence": conf, "f0": f0, "snr": snr,
+                "drone_key": key, "profile_label": p["label"],
+                "threat": p["threat"], "rpm_est": rpm}
+
+    def process(self, result: dict, visual_state: dict = None):
+        raw = result.get("confidence", 0.0)
+        self.confidence_ema = EMA_ALPHA * raw + (1 - EMA_ALPHA) * self.confidence_ema
+        if self.confidence_ema > 0.35:
+            self.alarm_count = min(self.alarm_count + 1, ALARM_FRAMES + 2)
+        else:
+            self.alarm_count = max(0, self.alarm_count - 1)
+        prev              = self.alarm_active
+        self.alarm_active = self.alarm_count >= ALARM_FRAMES
+
+        if result.get("detected") and result.get("f0"):
+            self.f0_window.append(result["f0"])
+        f0s, trend, rate = self._f0_drift()
+
+        label  = result.get("profile_label", "—") if result.get("detected") else "—"
+        threat = result.get("threat",         "LOW") if result.get("detected") else "LOW"
+        rpm    = result.get("rpm_est",         0)    if result.get("detected") else 0
+
+        v  = visual_state or {"confidence": 0.0, "alert": False, "fps": 0.0,
+                               "model_name": "disabled", "camera_live": False}
+        ct = _combined_threat(self.alarm_active, v.get("alert", False))
+
+        if self.alarm_active and not prev:
+            self.total_detections += 1
+            entry = {"time": datetime.now().strftime("%H:%M:%S.%f")[:-3], "type": label,
+                     "threat": threat, "f0": round(result.get("f0", 0)),
+                     "snr": round(result.get("snr", 0), 1),
+                     "confidence": round(self.confidence_ema, 2),
+                     "rpm": rpm, "trend": trend, "combined": ct}
+            self.detection_log = [entry] + self.detection_log[:49]
+
+        self.history.append(round(self.confidence_ema, 3))
+        with self._lock:
+            self._state = {
+                "status":          "DRONE DETECTED" if self.alarm_active else "MONITORING",
+                "confidence":      round(self.confidence_ema * 100, 1),
+                "alarm":           self.alarm_active,
+                "f0_hz":           round(result.get("f0", 0)) if result.get("detected") else 0,
+                "snr":             round(result.get("snr", 0), 1),
+                "profile_label":   label, "threat": threat, "rpm_est": rpm,
+                "rpm_trend":       trend, "rate_hz_per_s": round(rate, 1),
+                "history":         list(self.history),
+                "log":             self.detection_log[:10],
+                "frames":          self.frame_count,
+                "detections":      self.total_detections,
+                "combined_threat": ct, "visual": v,
+            }
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def reset(self):
+        self.confidence_ema   = 0.0
+        self.alarm_count      = 0
+        self.alarm_active     = False
+        self.detection_log    = []
+        self.history.clear()
+        self.f0_window.clear()
+        self.frame_count      = 0
+        self.total_detections = 0
+
+
+# ─── Simulated audio ──────────────────────────────────────────────────
+
+class SimulatedAudio:
+    """26s cycle: FPV 5" flyover → DJI Mavic → Shahed-136."""
+    _H = {"FPV_5INCH_RACING": (1.0, 0.55, 0.28, 0.14, 0.07, 0.04),
+          "DJI_MAVIC_RECON":  (1.0, 0.40, 0.20, 0.10),
+          "SHAHED_136":       (1.0, 0.65, 0.35, 0.20)}
+    _SEG = (( 2.0,  5.0,  700.0,  950.0,  120, "FPV_5INCH_RACING"),
+            ( 5.0,  7.0,  950.0,  700.0,   80, "FPV_5INCH_RACING"),
+            (10.0, 14.0,  183.0,  183.0,   95, "DJI_MAVIC_RECON"),
+            (17.0, 22.0,  242.0,  242.0,   85, "SHAHED_136"))
+    _CYCLE = 26.0
+
+    def __init__(self):
+        self._t = 0
+
+    def read_frame(self):
+        t_arr    = np.arange(self._t, self._t + FRAME_SIZE, dtype=np.float64) / SAMPLE_RATE
+        self._t += FRAME_SIZE
+        pos      = (self._t / SAMPLE_RATE) % self._CYCLE
+        for t0, t1, f0s, f0e, amp, dk in self._SEG:
+            if t0 < pos < t1:
+                f0   = f0s + (pos - t0) / (t1 - t0) * (f0e - f0s)
+                ramp = min((pos - t0) / 0.3, 1.0, (t1 - pos) / 0.3)
+                sig  = np.random.normal(0, 400, FRAME_SIZE)
+                for k, h in enumerate(self._H[dk], 1):
+                    sig += amp * ramp * h * np.sin(2 * np.pi * f0 * k * t_arr)
+                return sig.astype(np.int16)
+        return np.zeros(FRAME_SIZE, dtype=np.int16)
+
+
+# ─── Visual detector ──────────────────────────────────────────────────
+
+class VisualDetector:
+    _CLASSES = {"drone", "uav", "quadrotor", "airplane", "aircraft"}
+
+    def __init__(self, no_camera: bool = False, force_simulate: bool = False):
+        self.confidence  = 0.0
+        self.alert       = False
+        self.fps         = 0.0
+        self.camera_live = False
+        self.model_name  = "disabled"
+        self._lock       = threading.Lock()
+        self._disabled   = no_camera
+        self._force_sim  = force_simulate
+        self.model       = None
+        self.cap         = None
+
+        if no_camera or force_simulate:
+            if force_simulate:
+                self.model_name = "SIMULATION"
+            return
+
+        try:
+            from ultralytics import YOLO as _YOLO
+            self._load_model(_YOLO)
+        except ImportError:
+            return
+        if self.model is not None:
+            self._open_camera()
+
+    def _load_model(self, YOLO):
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download("keremberke/yolov8n-drone-detection", "best.pt")
+            self.model = YOLO(path); self.model_name = "drone-specific (HF)"; return
+        except Exception:
+            pass
+        try:
+            self.model = YOLO("yolov8n.pt"); self.model_name = "YOLOv8n COCO"
+        except Exception:
+            self.model = None; self.model_name = "load-failed"
+
+    def _open_camera(self):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS,          30)
+                self.cap = cap; self.camera_live = True
+            else:
+                cap.release()
+        except Exception:
+            pass
+
+    def start(self):
+        if self._disabled:
+            return
+        if self._force_sim or self.model is None:
+            if self.model_name not in ("disabled", "load-failed"):
+                threading.Thread(target=self._run_sim, daemon=True).start()
+            return
+        target = self._run_live if self.camera_live else self._run_sim
+        threading.Thread(target=target, daemon=True).start()
+
+    def _run_sim(self):
+        t0 = time.time()
+        while True:
+            cycle = (time.time() - t0) % 15.0
+            conf  = 0.75 if 2.0 < cycle < 4.0 else 0.0
+            with self._lock:
+                self.confidence = conf
+                self.alert      = conf >= VISUAL_THRESH
+                self.fps        = 30.0
+            time.sleep(1 / 30)
+
+    def _run_live(self):
+        fps_dq = deque(maxlen=30)
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01); continue
+            results   = self.model(frame, verbose=False)
+            best_conf = 0.0
+            for r in results:
+                names = getattr(r, "names", {})
+                for det in r.boxes:
+                    cls_name = names.get(int(det.cls[0]), "").lower()
+                    if any(c in cls_name for c in self._CLASSES):
+                        best_conf = max(best_conf, float(det.conf[0]))
+            fps_dq.append(time.time())
+            fps = (len(fps_dq) - 1) / max(fps_dq[-1] - fps_dq[0], 0.001) \
+                  if len(fps_dq) > 1 else 0.0
+            with self._lock:
+                self.confidence = best_conf
+                self.alert      = best_conf >= VISUAL_THRESH
+                self.fps        = round(fps, 1)
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {"confidence":  round(self.confidence * 100, 1),
+                    "alert":       self.alert,
+                    "fps":         self.fps,
+                    "model_name":  self.model_name,
+                    "camera_live": self.camera_live}
+
+
+# ─── Audio thread ─────────────────────────────────────────────────────
+
+class _AudioThread:
+    def __init__(self, detector: DroneDetector, visual: VisualDetector,
+                 read_frame_fn):
+        self._det  = detector
+        self._vis  = visual
+        self._rf   = read_frame_fn
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                samples = self._rf()
+                result  = self._det.analyze_frame(samples)
+                self._det.process(result, self._vis.get_state())
+            except Exception:
+                time.sleep(0.01)
+
+
+# ─── Inline calibration ───────────────────────────────────────────────
+
+_cal_lock  = threading.Lock()
+_cal_state: dict = {"running": False, "progress": 0.0, "elapsed": 0.0,
+                    "duration": 0.0, "frames": 0,
+                    "noise_floor": None, "rms_gate": None}
+
+
+def _calibrate_terminal(read_frame_fn, duration_s: float = 30.0) -> float:
+    print(f"\n{'='*58}")
+    print("  CALIBRATION -- Keep area clear of drones")
+    print(f"  Measuring noise floor for {duration_s:.0f}s ...")
+    print(f"{'='*58}\n")
+    rms_values, t0, t_ui = [], time.time(), time.time() - 1.0
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= duration_s:
+            break
+        samples = read_frame_fn()
+        rms_values.append(float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))))
+        if time.time() - t_ui >= 0.2:
+            t_ui = time.time()
+            pct  = elapsed / duration_s
+            bar  = "#" * int(pct * 40) + "." * (40 - int(pct * 40))
+            print(f"\r  [{bar}] {elapsed:4.0f}/{duration_s:.0f}s  "
+                  f"frames: {len(rms_values)}", end="", flush=True)
+    arr  = np.array(rms_values, dtype=np.float64)
+    nf   = float(np.median(arr))
+    gate = round(max(nf + 3.0 * np.std(arr), nf * 2.5), 6)
+    print(f"\n\n  DONE -- noise floor: {nf:.6f}   rms_gate: {gate}\n")
+    return gate
+
+
+def _start_inline_calibration(read_frame_fn, duration_s: float = CAL_SECS):
+    with _cal_lock:
+        if _cal_state["running"]:
+            return
+        _cal_state.update({"running": True, "progress": 0.0, "elapsed": 0.0,
+                           "duration": duration_s, "frames": 0,
+                           "noise_floor": None, "rms_gate": None})
+
+    def _run():
+        rms_values, t0 = [], time.time()
+        while True:
+            elapsed = time.time() - t0
+            if elapsed >= duration_s:
+                break
+            samples = read_frame_fn()
+            rms_values.append(float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))))
+            with _cal_lock:
+                _cal_state.update({"elapsed": elapsed,
+                                   "progress": min(elapsed / duration_s, 1.0),
+                                   "frames": len(rms_values)})
+        arr  = np.array(rms_values, dtype=np.float64)
+        nf   = float(np.median(arr))
+        gate = round(max(nf + 3.0 * np.std(arr), nf * 2.5), 6)
+        with _cal_lock:
+            _cal_state.update({"running": False, "progress": 1.0,
+                               "noise_floor": nf, "rms_gate": gate})
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _get_cal() -> dict:
+    with _cal_lock:
+        return dict(_cal_state)
 
 # ─── Global state ─────────────────────────────────────────────────────
 
@@ -157,7 +634,7 @@ class Wizard:
             return
         confs = [d.get("confidence", 0) for d in self.accumulated]
         max_c = max(confs) if confs else 0
-        gate  = _uf.RMS_GATE
+        gate  = RMS_GATE
         if max_c < 20.0:
             self._pass(1, {"max_confidence": round(max_c, 1), "rms_gate": gate,
                            "message": f"רעש רקע תקין — rms_gate: {gate:.6f}"})
@@ -441,7 +918,8 @@ async def _broadcast_loop():
         # Calibration: apply rms_gate when done
         cal = _get_cal()
         if _cal_prev_running and not cal.get("running") and cal.get("rms_gate"):
-            _uf.RMS_GATE = cal["rms_gate"]
+            global RMS_GATE
+            RMS_GATE = cal["rms_gate"]
         _cal_prev_running = cal.get("running", False)
 
         # Wizard tick
@@ -1176,7 +1654,8 @@ def main() -> None:
     # ── Calibration ───────────────────────────────────────────────────
     if args.calibrate:
         gate = _calibrate_terminal(_read_frame, args.cal_duration)
-        _uf.RMS_GATE = gate
+        global RMS_GATE
+        RMS_GATE = gate
         print(f"  RMS_GATE applied: {gate}")
 
     # ── Visual ────────────────────────────────────────────────────────

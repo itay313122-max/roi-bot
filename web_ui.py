@@ -25,6 +25,8 @@ import math
 import sys
 import threading
 import time
+import urllib.request
+import wave
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +62,15 @@ MIN_SNR       = 3.0
 VISUAL_THRESH = 0.60
 VERSION       = "3.0"
 CAL_SECS      = 30
+SPEC_BINS     = 64                      # spectrogram frequency bins
+SPEC_FREQ_MIN = 80.0
+SPEC_FREQ_MAX = 4000.0
+# log-spaced bin edges 80 → 4000 Hz (computed without numpy)
+_SPEC_EDGES   = [SPEC_FREQ_MIN * (SPEC_FREQ_MAX / SPEC_FREQ_MIN) ** (i / SPEC_BINS)
+                 for i in range(SPEC_BINS + 1)]
+REC_PRE_S     = 5                       # seconds of pre-alarm buffer to save
+REC_POST_S    = 5                       # seconds of post-alarm buffer to save
+REC_MAX       = 20                      # keep at most N recordings
 
 # ─── Drone database ───────────────────────────────────────────────────
 
@@ -180,7 +191,7 @@ class DroneDetector:
             "f0_hz": 0, "snr": 0.0, "profile_label": "—", "threat": "LOW",
             "rpm_est": 0, "rpm_trend": "STABLE", "rate_hz_per_s": 0.0,
             "history": [], "log": [], "frames": 0, "detections": 0,
-            "combined_threat": "CLEAR", "visual": {},
+            "combined_threat": "CLEAR", "visual": {}, "fft_bins": [],
         }
 
     def _f0_drift(self) -> tuple:
@@ -202,14 +213,20 @@ class DroneDetector:
 
     def analyze_frame(self, samples: np.ndarray) -> dict:
         self.frame_count += 1
-        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-        if rms < RMS_GATE:
-            return {"detected": False, "confidence": 0.0}
 
         x     = samples.astype(np.float32) / 32768.0
         fft   = np.fft.rfft(x * np.hanning(len(x)), n=FRAME_SIZE)
         psd   = np.abs(fft) ** 2
         freqs = np.fft.rfftfreq(FRAME_SIZE, 1.0 / SAMPLE_RATE)
+
+        # Spectrogram: log-spaced bins, always computed, 0–255 normalised
+        spec_power, _ = np.histogram(freqs, bins=_SPEC_EDGES, weights=psd)
+        sp_peak       = float(spec_power.max()) + 1e-12
+        fft_bins      = [min(255, int(float(v) / sp_peak * 255)) for v in spec_power]
+
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        if rms < RMS_GATE:
+            return {"detected": False, "confidence": 0.0, "fft_bins": fft_bins}
 
         mask     = (freqs >= SCAN_MIN_HZ) & (freqs <= SCAN_MAX_HZ)
         scan     = psd.copy(); scan[~mask] = 0.0
@@ -219,7 +236,8 @@ class DroneDetector:
         snr      = p_f0 / (float(np.median(psd[mask])) + 1e-12)
 
         if snr < MIN_SNR:
-            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr,
+                    "fft_bins": fft_bins}
 
         hw = max(SAMPLE_RATE / FRAME_SIZE * 2, f0 * 0.07)
 
@@ -230,13 +248,15 @@ class DroneDetector:
         h2 = _pw(f0 * 2) / (p_f0 + 1e-12)
         h3 = _pw(f0 * 3) / (p_f0 + 1e-12)
         if h2 < H2_RATIO_MIN or h3 < H3_RATIO_MIN:
-            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr,
+                    "fft_bins": fft_bins}
 
         n_harm = 2 + sum(1 for k in range(4, 9)
                          if _pw(f0 * k) / (p_f0 + 1e-12) >= 0.02)
         key, match, rpm = _classify_drone(f0, snr, n_harm)
         if key is None:
-            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr}
+            return {"detected": False, "confidence": 0.0, "f0": f0, "snr": snr,
+                    "fft_bins": fft_bins}
 
         p    = DRONE_DATABASE[key]
         conf = min((min(snr / (p["snr_threshold"] * 3.0), 1.0) * 0.5
@@ -244,7 +264,7 @@ class DroneDetector:
                     + min(h3 / 0.15, 1.0) * 0.2) * 0.7 + match * 0.3, 1.0)
         return {"detected": True, "confidence": conf, "f0": f0, "snr": snr,
                 "drone_key": key, "profile_label": p["label"],
-                "threat": p["threat"], "rpm_est": rpm}
+                "threat": p["threat"], "rpm_est": rpm, "fft_bins": fft_bins}
 
     def process(self, result: dict, visual_state: dict = None):
         raw = result.get("confidence", 0.0)
@@ -292,6 +312,7 @@ class DroneDetector:
                 "frames":          self.frame_count,
                 "detections":      self.total_detections,
                 "combined_threat": ct, "visual": v,
+                "fft_bins":        result.get("fft_bins", []),
             }
 
     def get_state(self) -> dict:
@@ -338,6 +359,68 @@ class SimulatedAudio:
                     sig += amp * ramp * h * np.sin(2 * np.pi * f0 * k * t_arr)
                 return sig.astype(np.int16)
         return np.zeros(FRAME_SIZE, dtype=np.int16)
+
+
+# ─── Recording manager ────────────────────────────────────────────────
+
+class RecordingManager:
+    """Saves WAV clips: REC_PRE_S before + REC_POST_S after each alarm onset."""
+
+    def __init__(self):
+        _pre_frames        = SAMPLE_RATE * REC_PRE_S // FRAME_SIZE
+        self._pre          = deque(maxlen=_pre_frames)
+        self._active       = False
+        self._post_target  = SAMPLE_RATE * REC_POST_S // FRAME_SIZE
+        self._post_count   = 0
+        self._buf          = []
+        self._last_alarm   = False
+        self._lock         = threading.Lock()
+        self.recordings: list = []      # file paths, newest last
+
+    def feed(self, samples: np.ndarray, alarm: bool):
+        self._pre.append(samples.copy())
+
+        if alarm and not self._last_alarm and not self._active:
+            # Alarm onset → start capture
+            self._active      = True
+            self._post_count  = 0
+            self._buf         = list(self._pre)
+
+        if self._active:
+            self._post_count += 1
+            if self._post_count > 1:        # first frame already in pre-buffer copy
+                self._buf.append(samples.copy())
+            if self._post_count >= self._post_target:
+                self._save()
+                self._active = False
+
+        self._last_alarm = alarm
+
+    def _save(self):
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"alarm_{ts}.wav"
+        try:
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                for frame in self._buf:
+                    wf.writeframes(frame.astype(np.int16).tobytes())
+            with self._lock:
+                self.recordings.append(path)
+                while len(self.recordings) > REC_MAX:
+                    old = self.recordings.pop(0)
+                    try:
+                        Path(old).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def list(self) -> list:
+        with self._lock:
+            return [{"name": Path(p).name, "url": f"/{p}"}
+                    for p in reversed(self.recordings)]
 
 
 # ─── Visual detector ──────────────────────────────────────────────────
@@ -470,6 +553,8 @@ class _AudioThread:
                 samples = self._rf()
                 result  = self._det.analyze_frame(samples)
                 self._det.process(result, self._vis.get_state())
+                if _recorder is not None:
+                    _recorder.feed(samples, self._det.get_state().get("alarm", False))
             except Exception:
                 time.sleep(0.01)
 
@@ -563,6 +648,26 @@ _cal_prev_running = False
 
 _user_lat = 0.0
 _user_lon = 0.0
+
+_recorder: RecordingManager = None
+
+_telegram_token   = ""
+_telegram_chat_id = ""
+_telegram_prev    = "CLEAR"
+
+
+def _send_telegram(text: str) -> None:
+    if not _telegram_token or not _telegram_chat_id:
+        return
+    url  = f"https://api.telegram.org/bot{_telegram_token}/sendMessage"
+    body = json.dumps({"chat_id": _telegram_chat_id, "text": text,
+                       "parse_mode": "HTML"}).encode()
+    req  = urllib.request.Request(url, data=body,
+                                  headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
 
 
 # ─── Field Test Wizard ────────────────────────────────────────────────
@@ -954,6 +1059,25 @@ async def _broadcast_loop():
         # Wizard tick
         _wizard.tick(s)
 
+        # Telegram: fire on CONFIRMED onset
+        ct = s.get("combined_threat", "CLEAR")
+        global _telegram_prev
+        if ct != _telegram_prev:
+            if ct == "CONFIRMED":
+                _t = (f"🚨 <b>DRONE CONFIRMED</b>\n"
+                      f"Type: {s.get('profile_label','—')}\n"
+                      f"f0: {s.get('f0_hz',0)} Hz  SNR: {s.get('snr',0):.1f}×\n"
+                      f"Dir: {s.get('rpm_trend','—')}  "
+                      f"Range: {_range_est(s.get('snr',0), True)}")
+                threading.Thread(target=_send_telegram, args=(_t,), daemon=True).start()
+            elif ct == "ACOUSTIC ONLY":
+                _t = f"⚠️ Acoustic signature detected — {s.get('profile_label','—')}"
+                threading.Thread(target=_send_telegram, args=(_t,), daemon=True).start()
+            elif _telegram_prev in ("CONFIRMED", "ACOUSTIC ONLY"):
+                threading.Thread(target=_send_telegram,
+                                 args=("✅ Threat cleared — MONITORING",), daemon=True).start()
+        _telegram_prev = ct
+
         vis = s.get("visual") or {}
 
         # Drone geo position estimate
@@ -997,6 +1121,8 @@ async def _broadcast_loop():
             "drone_lat":           _dlat,
             "drone_lon":           _dlon,
             "drone_radius_m":      _rad_m,
+            "fft_bins":            s.get("fft_bins", []),
+            "recordings":          _recorder.list() if _recorder else [],
         }
         msg  = json.dumps(payload)
         dead = set()
@@ -1066,6 +1192,20 @@ body{background:#060a06;color:#00ff41;font-family:'Courier New',monospace;min-he
 /* ── Canvas row ── */
 #canvas-row{grid-column:1/-1;display:grid;grid-template-columns:2fr 1fr;gap:10px}
 canvas{display:block;width:100%;border-radius:2px}
+/* ── Spectrogram ── */
+#spec-block{grid-column:1/-1}
+#spec-wrap{position:relative;background:#030803;border-radius:2px;overflow:hidden}
+#spec-cv{display:block;width:100%;height:80px;image-rendering:pixelated;image-rendering:crisp-edges}
+#spec-labels{position:absolute;top:0;left:0;height:100%;width:28px;display:flex;flex-direction:column;justify-content:space-between;padding:2px 0;pointer-events:none}
+#spec-labels span{font-size:.55em;color:#335533;padding-left:2px;line-height:1}
+/* ── Recordings ── */
+#rec-panel{display:none;position:absolute;bottom:calc(100% + 4px);right:0;
+           background:#080f08;border:1px solid #1a3a1a;border-radius:3px;
+           padding:8px;min-width:260px;z-index:50;max-height:200px;overflow-y:auto}
+#rec-panel a{display:block;font-size:.72em;color:#88aaff;padding:2px 0;
+             text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#rec-panel a:hover{text-decoration:underline}
+#rec-wrap{position:relative}
 /* ── Log ── */
 #log-block{grid-column:1/-1}
 #log-ul{list-style:none;max-height:150px;overflow-y:auto;font-size:.75em}
@@ -1202,6 +1342,17 @@ button.wiz-btn:hover{background:#0a0a20}
     </div>
   </div>
 
+  <!-- Spectrogram -->
+  <div class="card" id="spec-block">
+    <div class="card-title">ACOUSTIC SPECTROGRAM — 80 Hz → 4 kHz  ◀ time</div>
+    <div id="spec-wrap">
+      <canvas id="spec-cv" width="300" height="64"></canvas>
+      <div id="spec-labels">
+        <span>4k</span><span>2k</span><span>500</span><span>80</span>
+      </div>
+    </div>
+  </div>
+
   <!-- Map panel -->
   <div class="card" id="map-block">
     <div class="card-title">LIVE POSITION MAP</div>
@@ -1225,6 +1376,11 @@ button.wiz-btn:hover{background:#0a0a20}
     <button id="btn-log" onclick="doLog()">● START LOG</button>
     <button onclick="doReset()">↺ RESET</button>
     <button class="wiz-btn" onclick="openWizard()">🧪 FIELD TEST</button>
+    <div id="rec-wrap">
+      <button id="btn-rec" onclick="toggleRecPanel()" style="border-color:#446644;color:#446644">
+        🎙 RECORDINGS (0)</button>
+      <div id="rec-panel"><em style="color:#446644;font-size:.75em">No recordings yet</em></div>
+    </div>
     <span id="stats-r">frames: — | detections: —</span>
   </div>
 
@@ -1402,6 +1558,12 @@ function update(d) {
 
   // map
   _updateMap(d);
+
+  // spectrogram
+  if (d.fft_bins && d.fft_bins.length) _drawSpectrogram(d.fft_bins);
+
+  // recordings
+  _updateRecordings(d.recordings || []);
 }
 
 function setBar(barId, lblId, pct, cls) {
@@ -1647,6 +1809,78 @@ function updateWizard(wiz) {
   }
 }
 
+// ── Spectrogram ──────────────────────────────────────────────────────
+let _specCtx = null, _specImg = null, _specW = 300, _specH = 64;
+
+function _initSpec() {
+  const cv = document.getElementById('spec-cv');
+  _specCtx  = cv.getContext('2d');
+  _specW    = cv.width; _specH = cv.height;
+  _specImg  = _specCtx.createImageData(_specW, _specH);
+  // fill dark green background
+  for (let i = 0; i < _specImg.data.length; i += 4) {
+    _specImg.data[i]=6; _specImg.data[i+1]=10; _specImg.data[i+2]=6; _specImg.data[i+3]=255;
+  }
+}
+
+function _drawSpectrogram(bins) {
+  if (!_specCtx) _initSpec();
+  const w = _specW, h = _specH, d = _specImg.data;
+  // Shift image left by 1px
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w - 1; x++) {
+      const si = (y * w + x + 1) * 4, di = (y * w + x) * 4;
+      d[di] = d[si]; d[di+1] = d[si+1]; d[di+2] = d[si+2]; d[di+3] = 255;
+    }
+  }
+  // Draw new column at right; y=0 = highest freq, y=h-1 = lowest
+  const n = bins.length;
+  for (let y = 0; y < h; y++) {
+    const binIdx = Math.floor((h - 1 - y) * n / h);  // flip: low freq at bottom
+    const v = (bins[binIdx] || 0) / 255;              // 0-1
+    let r = 6, g = 10, b = 6;
+    if (v > 0.02) {
+      if (v < 0.45) {
+        g = Math.round(v / 0.45 * 200);
+        r = 6; b = 6;
+      } else if (v < 0.75) {
+        const t = (v - 0.45) / 0.30;
+        r = Math.round(t * 255); g = 200; b = 6;
+      } else {
+        const t = (v - 0.75) / 0.25;
+        r = 255; g = Math.round((1 - t) * 200); b = 6;
+      }
+    }
+    const di = (y * w + w - 1) * 4;
+    d[di] = r; d[di+1] = g; d[di+2] = b; d[di+3] = 255;
+  }
+  _specCtx.putImageData(_specImg, 0, 0);
+}
+
+// ── Recordings ────────────────────────────────────────────────────────
+let _recPanelOpen = false;
+
+function toggleRecPanel() {
+  _recPanelOpen = !_recPanelOpen;
+  document.getElementById('rec-panel').style.display = _recPanelOpen ? 'block' : 'none';
+}
+
+function _updateRecordings(recs) {
+  const btn = document.getElementById('btn-rec');
+  btn.textContent = `🎙 RECORDINGS (${recs.length})`;
+  btn.style.color       = recs.length > 0 ? '#88aaff' : '#446644';
+  btn.style.borderColor = recs.length > 0 ? '#88aaff' : '#446644';
+  if (!_recPanelOpen) return;
+  const panel = document.getElementById('rec-panel');
+  if (!recs.length) {
+    panel.innerHTML = '<em style="color:#446644;font-size:.75em">No recordings yet</em>';
+    return;
+  }
+  panel.innerHTML = recs.map(r =>
+    `<a href="${r.url}" download="${r.name}">⬇ ${r.name}</a>`
+  ).join('');
+}
+
 // ── Map ──────────────────────────────────────────────────────────────
 let _map = null, _userMarker = null, _droneMarker = null;
 let _droneCircle = null, _droneTrail = null, _trailPts = [];
@@ -1757,12 +1991,23 @@ connect();
 
 from fastapi.responses import FileResponse
 
+@app.get("/api/recordings")
+async def api_recordings():
+    return _recorder.list() if _recorder else []
+
+
 @app.get("/{filename:path}")
 async def serve_file(filename: str):
-    p = Path(filename)
-    if p.suffix == ".html" and p.exists() and not p.is_absolute():
-        return FileResponse(str(p), media_type="text/html")
     from fastapi.responses import Response
+    p = Path(filename)
+    if p.is_absolute() or not p.exists():
+        return Response(status_code=404)
+    if p.suffix == ".html":
+        return FileResponse(str(p), media_type="text/html")
+    if p.suffix == ".wav":
+        return FileResponse(str(p), media_type="audio/wav",
+                            headers={"Content-Disposition":
+                                     f'attachment; filename="{p.name}"'})
     return Response(status_code=404)
 
 
@@ -1770,17 +2015,25 @@ async def serve_file(filename: str):
 
 def main() -> None:
     global _detector, _visual, _audio_th, _read_frame, _mic_live, _mode, _t0
+    global _recorder, _telegram_token, _telegram_chat_id
 
     ap = argparse.ArgumentParser(description="FPV Detect Web UI",
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--simulate",    action="store_true")
-    ap.add_argument("--no-camera",   action="store_true")
-    ap.add_argument("--port",        type=int, default=8080)
-    ap.add_argument("--no-browser",  action="store_true")
-    ap.add_argument("--calibrate",   action="store_true")
-    ap.add_argument("--cal-duration",type=float, default=30.0)
+    ap.add_argument("--simulate",       action="store_true")
+    ap.add_argument("--no-camera",      action="store_true")
+    ap.add_argument("--port",           type=int, default=8080)
+    ap.add_argument("--no-browser",     action="store_true")
+    ap.add_argument("--calibrate",      action="store_true")
+    ap.add_argument("--cal-duration",   type=float, default=30.0)
+    ap.add_argument("--telegram-token", type=str, default="",
+                    help="Telegram Bot API token for alarm alerts")
+    ap.add_argument("--telegram-chat",  type=str, default="",
+                    help="Telegram chat_id to send alerts to")
     args = ap.parse_args()
+
+    _telegram_token   = args.telegram_token
+    _telegram_chat_id = args.telegram_chat
 
     # ── Audio ─────────────────────────────────────────────────────────
     try:
@@ -1823,10 +2076,12 @@ def main() -> None:
     _visual = VisualDetector(no_camera=args.no_camera, force_simulate=args.simulate)
     _visual.start()
 
-    # ── Detector ─────────────────────────────────────────────────────
+    # ── Detector + Recorder ───────────────────────────────────────────
     _detector = DroneDetector()
+    _recorder = RecordingManager()
     _audio_th = _AudioThread(_detector, _visual, _read_frame)
     _audio_th.start()
+    print(f"  Recorder: saving alarms to alarm_YYYYMMDD_HHMMSS.wav")
 
     # ── Mode ─────────────────────────────────────────────────────────
     _mode = ("FULL"          if _mic_live and _visual.camera_live
@@ -1837,8 +2092,10 @@ def main() -> None:
 
     _t0 = time.monotonic()
     url = f"http://localhost:{args.port}"
-    print(f"  Mode  : {_mode}")
-    print(f"  Server: {url}")
+    print(f"  Mode    : {_mode}")
+    print(f"  Server  : {url}")
+    if _telegram_token:
+        print(f"  Telegram: alerts → chat {_telegram_chat_id}")
 
     if not args.no_browser:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
